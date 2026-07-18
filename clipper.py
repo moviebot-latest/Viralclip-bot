@@ -99,6 +99,20 @@ async def get_video_dimensions(video_path: str) -> tuple:
     return await loop.run_in_executor(None, _probe)
 
 
+async def get_video_duration(video_path: str) -> float:
+    loop = asyncio.get_event_loop()
+
+    def _probe():
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", video_path,
+        ]
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+        return float(out)
+
+    return await loop.run_in_executor(None, _probe)
+
+
 def build_ass_subtitle(words: list, clip_start: float, out_path: str,
                         style: str = "style_2"):
     """

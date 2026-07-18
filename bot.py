@@ -243,10 +243,54 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_video_job(context, user_id, text, status_message=update.message)
 
 
-async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, source_url: str, status_message=None):
+async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    msg = update.message
+
+    if user_id in active_jobs:
+        await msg.reply_text("⏳ Tera pehle se ek video process ho raha hai. Uske complete hone ka wait karo.")
+        return
+
+    if not await db.can_process(user_id, FREE_DAILY_LIMIT):
+        await msg.reply_text(
+            "🚫 Aaj ka free limit (5 videos) khatam ho gaya. Kal try karo ya admin se bonus credit maango."
+        )
+        return
+
+    tg_file = msg.video or msg.document
+    if tg_file is None:
+        return
+
+    max_size = await db.get_max_file_size(user_id)
+    if tg_file.file_size and tg_file.file_size > max_size:
+        limit_gb = max_size / (1024 ** 3)
+        await msg.reply_text(f"❌ File bahut badi hai. Tera limit {limit_gb:.0f}GB hai.")
+        return
+
+    status_msg = await msg.reply_text("📥 File download ho raha hai...")
+
+    job_id = uuid.uuid4().hex[:12]
+    local_path = os.path.join("downloads", f"{job_id}_upload.mp4")
+
+    try:
+        file_obj = await context.bot.get_file(tg_file.file_id)
+        await file_obj.download_to_drive(local_path)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ File download nahi ho payi: {str(e)[:150]}")
+        return
+
+    await status_msg.edit_text("✅ File mil gayi, processing shuru...")
+    await process_video_job(
+        context, user_id, source_url=f"direct_upload:{tg_file.file_id}",
+        status_message=status_msg, local_video_path=local_path,
+    )
+
+
+async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, source_url: str,
+                             status_message=None, local_video_path: str = None):
     active_jobs.add(user_id)
     job_id = uuid.uuid4().hex[:12]
-    video_path = None
+    video_path = local_video_path
     audio_path = None
 
     async def send_status(text):
@@ -258,37 +302,51 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
         await db.create_job(job_id, user_id, source_url)
 
         status_msg = await send_status("🔎 Video check kar raha hoon...")
+        cached_transcript = None
 
-        # --- pre-download validation ---
-        meta = await downloader.probe_metadata(source_url)
-        dur_check = safety.check_duration(meta["duration"], MAX_VIDEO_SECONDS)
-        if not dur_check["ok"]:
-            await status_msg.edit_text(f"❌ {dur_check['reason']}")
-            await db.update_job_status(job_id, "rejected")
-            return
+        if local_video_path is None:
+            # --- pre-download validation (link flow only) ---
+            meta = await downloader.probe_metadata(source_url)
+            dur_check = safety.check_duration(meta["duration"], MAX_VIDEO_SECONDS)
+            if not dur_check["ok"]:
+                await status_msg.edit_text(f"❌ {dur_check['reason']}")
+                await db.update_job_status(job_id, "rejected")
+                return
 
-        safety_check = safety.check_metadata_safety(meta["title"], meta["description"])
-        if not safety_check["safe"]:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("⚠️ Galat laga? Admin ko batao", callback_data=f"appeal|{source_url}")
-            ]])
-            await status_msg.edit_text(
-                f"❌ Ye content policy ke against lag raha hai: {safety_check['reason']}\n"
-                "Agar galat laga hai toh niche button se admin ko bata sakte ho.",
-                reply_markup=kb,
-            )
-            await db.update_job_status(job_id, "rejected")
-            return
+            safety_check = safety.check_metadata_safety(meta["title"], meta["description"])
+            if not safety_check["safe"]:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⚠️ Galat laga? Admin ko batao", callback_data=f"appeal|{source_url}")
+                ]])
+                await status_msg.edit_text(
+                    f"❌ Ye content policy ke against lag raha hai: {safety_check['reason']}\n"
+                    "Agar galat laga hai toh niche button se admin ko bata sakte ho.",
+                    reply_markup=kb,
+                )
+                await db.update_job_status(job_id, "rejected")
+                return
 
-        # --- download (with caching) ---
-        url_hash = downloader.url_hash(source_url)
-        cached = await db.get_cached_download(url_hash)
+            # --- download (with caching) ---
+            url_hash = downloader.url_hash(source_url)
+            cached = await db.get_cached_download(url_hash)
 
-        await status_msg.edit_text("📥 Downloading video...")
-        if cached and os.path.exists(cached[0]):
-            video_path = cached[0]
+            await status_msg.edit_text("📥 Downloading video...")
+            if cached and os.path.exists(cached[0]):
+                video_path = cached[0]
+            else:
+                video_path = await downloader.download_best_quality(source_url, job_id)
+            if cached:
+                cached_transcript = cached[1]
         else:
-            video_path = await downloader.download_best_quality(source_url, job_id)
+            # --- direct upload flow: skip link validation/download ---
+            await status_msg.edit_text("🔎 Uploaded video check kar raha hoon...")
+            duration = await clipper.get_video_duration(video_path)
+            dur_check = safety.check_duration(duration, MAX_VIDEO_SECONDS)
+            if not dur_check["ok"]:
+                await status_msg.edit_text(f"❌ {dur_check['reason']}")
+                await db.update_job_status(job_id, "rejected")
+                return
+            url_hash = downloader.url_hash(f"upload:{job_id}")
 
         await db.update_job_status(job_id, "processing")
 
@@ -297,9 +355,9 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
         audio_path = os.path.join("downloads", f"{job_id}_audio.wav")
         await clipper.extract_audio(video_path, audio_path)
 
-        if cached and cached[1]:
+        if cached_transcript:
             import json as _json
-            transcript = _json.loads(cached[1])
+            transcript = _json.loads(cached_transcript)
         else:
             transcript = await ai_analysis.transcribe(audio_path)
             import json as _json
@@ -424,6 +482,7 @@ def main():
     app.add_handler(CallbackQueryHandler(feedback_cb, pattern=r"^fb\|"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video_upload))
 
     logger.info("Bot starting...")
     app.run_polling()
@@ -431,4 +490,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-  

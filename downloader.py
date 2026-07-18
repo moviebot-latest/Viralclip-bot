@@ -4,6 +4,14 @@ Wraps yt-dlp for:
   1. Cheap metadata probe (no download) -> used for pre-validation
   2. Full best-quality download
 Runs yt-dlp in a thread executor so it never blocks the asyncio loop.
+
+YouTube bot-detection note:
+YouTube frequently blocks server/datacenter IPs (like Render's) with
+"Sign in to confirm you're not a bot". The fix is to export cookies from a
+real logged-in browser session and point yt-dlp at that cookie file via
+the COOKIES_FILE env var / cookies.txt in the project root. If no cookie
+file is present, downloads fall back to cookie-less (may fail on YouTube
+specifically; other platforms are typically unaffected).
 """
 
 import asyncio
@@ -13,6 +21,14 @@ import yt_dlp
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+
+
+def _cookie_opts() -> dict:
+    if os.path.exists(COOKIES_FILE):
+        return {"cookiefile": COOKIES_FILE}
+    return {}
 
 
 def url_hash(url: str) -> str:
@@ -27,7 +43,10 @@ async def probe_metadata(url: str) -> dict:
     loop = asyncio.get_event_loop()
 
     def _probe():
-        ydl_opts = {"quiet": True, "skip_download": True, "no_warnings": True}
+        ydl_opts = {
+            "quiet": True, "skip_download": True, "no_warnings": True,
+            **_cookie_opts(),
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return {
@@ -57,6 +76,7 @@ async def download_best_quality(url: str, job_id: str) -> str:
             "no_warnings": True,
             "retries": 3,
             "fragment_retries": 3,
+            **_cookie_opts(),
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
