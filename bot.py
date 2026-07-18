@@ -401,6 +401,13 @@ def run_health_server():
 
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Python 3.14 no longer auto-creates an event loop for the main thread.
+    # python-telegram-bot's run_polling() relies on asyncio.get_event_loop()
+    # internally, so we create and set one explicitly before building the app.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
@@ -424,4 +431,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+  
