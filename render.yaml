@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: viralclip-bot
+    env: python
+    buildCommand: "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+    disk:
+      name: viralclip-data
+      mountPath: /opt/render/project/src/downloads
+      sizeGB: 10
