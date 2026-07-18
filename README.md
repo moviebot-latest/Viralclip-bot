@@ -1,34 +1,40 @@
-# ViralClip Bot — Phase 1
+# Telegram Local Bot API Server
 
-Telegram bot: link/video bhejo → AI se best 10 viral clips (hooks + captions + smart crop) nikaal ke bhejta hai.
+Raises Telegram Bot API's file limits from 50MB to 2GB. Deploy this as its
+own Render service, separate from the main bot.
 
 ## Setup
 
-1. `.env.example` ko `.env` bana ke apni values daalo:
-   - `BOT_TOKEN` — @BotFather se lo
-   - `GROQ_API_KEY` — console.groq.com se lo
-   - `ADMIN_IDS` — apna Telegram numeric user_id (comma-separated agar multiple)
+1. Push this folder (`Dockerfile` + `render.yaml`) as its **own GitHub repo**
+   (or a subfolder with Root Directory set in Render — see below).
 
-2. GitHub par ye pura repo push karo.
+2. Render → **New + → Web Service**
+   - Environment: **Docker** (not Python)
+   - Connect this repo/folder
+   - Plan: Free (note: free plan has limited RAM — 512MB — which may be tight
+     for large video files; Starter plan is more reliable for real use)
 
-3. Render par:
-   - New + → Background Worker
-   - Repo connect karo (render.yaml auto-detect hoga)
-   - Environment tab mein BOT_TOKEN, GROQ_API_KEY, ADMIN_IDS add karo
-   - Deploy
+3. Environment Variables:
+   - `TELEGRAM_API_ID` — from my.telegram.org
+   - `TELEGRAM_API_HASH` — from my.telegram.org
 
-4. Local test (optional):
-   ```
-   pip install -r requirements.txt
-   python bot.py
-   ```
-   (ffmpeg system mein installed hona chahiye: `apt install ffmpeg`)
+4. Deploy. Once live, copy the service URL, e.g.
+   `https://telegram-bot-api-server.onrender.com`
 
-## Files
-- `bot.py` — main entrypoint, handlers, pipeline orchestration
-- `database.py` — SQLite schema + helpers
-- `downloader.py` — yt-dlp wrapper
-- `ai_analysis.py` — Groq Whisper transcription + LLM clip analysis
-- `clipper.py` — ffmpeg cutting, smart crop, caption burn-in
-- `safety.py` — basic content safety checks
-- `render.yaml` — Render deployment config
+5. Go to your **main bot** service on Render → Environment tab → add:
+   - `LOCAL_BOT_API_URL` = `https://telegram-bot-api-server.onrender.com`
+
+6. Redeploy the main bot. It will now route all Telegram API calls through
+   your local server, unlocking 2GB file support.
+
+## Important notes
+
+- Free Render plan has **no persistent disk** guarantee and **512MB RAM** —
+  large video uploads/downloads may be slow or fail under memory pressure.
+  If this becomes unreliable, upgrading this specific service to Starter
+  ($7/mo) fixes it while the main bot can stay free.
+- Both services must stay awake for uploads to work — free tier sleep
+  after 15 min inactivity applies to this service too. Use UptimeRobot on
+  BOTH service URLs to keep them alive.
+- Build takes longer than usual (~5-10 min) since it compiles
+  telegram-bot-api from source.

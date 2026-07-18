@@ -47,6 +47,11 @@ FREE_DAILY_LIMIT = 5
 MAX_CLIPS = 10
 MAX_VIDEO_SECONDS = 2 * 3600  # 2 hour cap, Phase 1
 
+# Local Bot API server (raises Telegram's 20MB download / 50MB upload caps to 2GB).
+# Set LOCAL_BOT_API_URL to your deployed telegram-bot-api service, e.g.
+# "https://your-bot-api-server.onrender.com". Leave unset to use api.telegram.org.
+LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").rstrip("/")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -466,7 +471,11 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    builder = Application.builder().token(BOT_TOKEN).post_init(post_init)
+    if LOCAL_BOT_API_URL:
+        builder = builder.base_url(f"{LOCAL_BOT_API_URL}/bot").base_file_url(f"{LOCAL_BOT_API_URL}/file/bot")
+        logger.info(f"Using local Bot API server: {LOCAL_BOT_API_URL}")
+    app = builder.build()
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
