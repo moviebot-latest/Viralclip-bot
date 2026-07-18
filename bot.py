@@ -1,878 +1,427 @@
-# Ultra Bot v3.0 — FIX #24: RPCError as ServerError (latest pyrogram)
+"""
+bot.py
+Main Telegram bot entrypoint. Orchestrates the full pipeline:
+link -> validate -> download -> transcribe -> analyze -> cut/caption -> send
+
+Phase 1 scope (working end-to-end):
+  - /start, /history, /myappeals, /status
+  - Link handling with pre-download validation + safety check
+  - Daily free limit (5/day) + admin bonus credits
+  - File size tiers (2GB default / 4GB admin-approved)
+  - 1 concurrent job per user
+  - Live status updates
+  - Word-boundary-safe clipping + smart crop + captions
+  - Virality score + reasoning + hook + platform suggestion in output
+  - Appeal system (user disputes a rejection -> admin approves/rejects)
+  - Temp file cleanup
+  - Download caching (same URL reused)
+
+Admin commands: /addcredit, /allow4gb, /revoke4gb, review approve/reject buttons
+"""
+
 import os
-import sys
-import glob
-import time
-import math
-import asyncio
+import uuid
 import logging
-import traceback
-from collections import deque
-from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, MessageNotModified
-from pyrogram.errors import RPCError as ServerError  # FIX #24 — ServerError removed in latest pyrogram
+import asyncio
+import threading
+from dotenv import load_dotenv
+from flask import Flask
 
-# ══════════════════════════════════════════════════════════════
-#  LOGGING
-# ══════════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
-log = logging.getLogger("UltraBot")
-
-
-# ══════════════════════════════════════════════════════════════
-#  FIX #12 + #19 — ENV VALIDATION
-#  - Clear error if missing (not cryptic TypeError)
-#  - ValueError if API_ID is not a number
-# ══════════════════════════════════════════════════════════════
-def _require_env(key: str) -> str:
-    val = os.getenv(key, "").strip()
-    if not val:
-        log.critical(f"❌ Environment variable '{key}' is not set. Bot cannot start.")
-        sys.exit(1)
-    return val
-
-def _require_int_env(key: str) -> int:
-    raw = _require_env(key)
-    try:
-        return int(raw)
-    except ValueError:
-        log.critical(f"❌ '{key}' must be an integer, got: '{raw}'")
-        sys.exit(1)
-
-API_ID    = _require_int_env("API_ID")
-API_HASH  = _require_env("API_HASH")
-BOT_TOKEN = _require_env("BOT_TOKEN")
-
-
-# ══════════════════════════════════════════════════════════════
-#  CONSTANTS & DIRS
-# ══════════════════════════════════════════════════════════════
-DOWNLOAD_DIR        = "downloads"
-THUMB_DIR           = "thumbs"
-MAX_FILE_WARN       = 1.8 * 1024 ** 3  # 1.8 GB — warn near TG limit
-FFMPEG_CUT_TIMEOUT  = 600              # 10 min per segment
-FFPROBE_TIMEOUT     = 30              # 30 s for duration probe
-THUMB_TIMEOUT       = 15              # 15 s for thumbnail
-MIN_PART_BYTES      = 1024            # FIX #21 — reject parts smaller than 1 KB
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(THUMB_DIR,    exist_ok=True)
-
-
-# ══════════════════════════════════════════════════════════════
-#  FIX #13 + #22 — Stale file cleanup on startup
-#  Added .wmv and .3gp patterns that were missing in v2
-# ══════════════════════════════════════════════════════════════
-def _cleanup_stale_files() -> None:
-    patterns = [
-        f"{DOWNLOAD_DIR}/video_*.mp4",  f"{DOWNLOAD_DIR}/video_*.mkv",
-        f"{DOWNLOAD_DIR}/video_*.avi",  f"{DOWNLOAD_DIR}/video_*.mov",
-        f"{DOWNLOAD_DIR}/video_*.webm", f"{DOWNLOAD_DIR}/video_*.wmv",
-        f"{DOWNLOAD_DIR}/video_*.3gp",  f"{DOWNLOAD_DIR}/part_*.mp4",
-        f"{THUMB_DIR}/thumb_*.jpg",
-    ]
-    removed = 0
-    for pat in patterns:
-        for f in glob.glob(pat):
-            try:
-                os.remove(f)
-                removed += 1
-            except Exception:
-                pass
-    if removed:
-        log.info(f"🧹 Cleaned {removed} stale file(s) from previous session.")
-
-_cleanup_stale_files()
-
-
-# ══════════════════════════════════════════════════════════════
-#  CLIENT
-# ══════════════════════════════════════════════════════════════
-app = Client(
-    "ultra-bot",
-    api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-    in_memory=True,
-    sleep_threshold=300,
-    ipv6=False,
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters,
 )
 
+import database as db
+import downloader
+import safety
+import ai_analysis
+import clipper
 
-# ══════════════════════════════════════════════════════════════
-#  PER-USER STATE
-# ══════════════════════════════════════════════════════════════
-user_files:  dict[int, str]           = {}
-user_locks:  dict[int, asyncio.Lock]  = {}
-user_cancel: dict[int, asyncio.Event] = {}
-user_status: dict[int, dict]          = {}
+load_dotenv()
 
-# FIX #23 — Prune throttled: track last prune time, don't prune on every call
-_MAX_USERS        = 2000
-_last_prune_time  = 0.0
-_PRUNE_INTERVAL   = 300  # prune at most once every 5 minutes
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x}
+FREE_DAILY_LIMIT = 5
+MAX_CLIPS = 10
+MAX_VIDEO_SECONDS = 2 * 3600  # 2 hour cap, Phase 1
 
-def _prune_state() -> None:
-    """
-    Drop oldest inactive users when state grows too large.
-    FIX #17: Never prune a user whose lock is currently held (task running).
-    FIX #23: Throttled — runs at most once per 5 minutes.
-    """
-    global _last_prune_time
-    now = time.time()
-    if len(user_locks) < _MAX_USERS:
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# tracks users with an active job right now (in-memory, per-process)
+active_jobs = set()
+
+
+# ---------------- helper ----------------
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+async def cleanup_files(*paths):
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            logger.warning(f"Could not remove {p}")
+
+
+# ---------------- basic commands ----------------
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Bhej de koi bhi YouTube/Instagram/TikTok/Facebook link ya video file — "
+        "main usme se best 10 viral clips nikaal ke dunga, hooks aur captions ke saath.\n\n"
+        "Free: 5 videos/day. Zyada chahiye toh admin se bonus credit maango.\n\n"
+        "⚠️ Disclaimer: content ki copyright responsibility tumhari hai, bot sirf ek tool hai."
+    )
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = await db.get_user_history(update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("Abhi tak koi video process nahi hua.")
         return
-    if now - _last_prune_time < _PRUNE_INTERVAL:
+    lines = [f"• {r[1][:40]}... — {r[3]} ({r[2][:16]})" for r in rows]
+    await update.message.reply_text("📜 Tera history:\n" + "\n".join(lines))
+
+
+async def myappeals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    count = await db.get_appeal_count_today(user_id)
+    await update.message.reply_text(f"Aaj ke appeals: {count}/3")
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"✅ Bot online.\nActive jobs abhi: {len(active_jobs)}"
+    )
+
+
+# ---------------- admin commands ----------------
+
+async def addcredit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    _last_prune_time = now
-
-    # FIX #17 — exclude users with active locks from pruning
-    active = {uid for uid, lk in user_locks.items() if lk.locked()}
-    inactive = [uid for uid in list(user_locks.keys()) if uid not in active]
-    # Drop oldest half of inactive users
-    to_remove = set(inactive[:len(inactive) // 2])
-
-    for d in (user_locks, user_cancel, user_status):
-        for k in list(to_remove):
-            d.pop(k, None)
-    for k in list(to_remove):
-        path = user_files.pop(k, None)
-        if path:
-            try: os.remove(path)
-            except: pass
-
-    log.info(f"🧹 Pruned {len(to_remove)} inactive user states.")
-
-
-def _get_lock(uid: int) -> asyncio.Lock:
-    _prune_state()
-    if uid not in user_locks:
-        user_locks[uid] = asyncio.Lock()
-    return user_locks[uid]
-
-def _get_cancel(uid: int) -> asyncio.Event:
-    if uid not in user_cancel:
-        user_cancel[uid] = asyncio.Event()
-    return user_cancel[uid]
-
-def _set_status(uid: int, task: str, detail: str = "") -> None:
-    user_status[uid] = {"task": task, "detail": detail, "since": time.time()}
-
-def _clear_status(uid: int) -> None:
-    user_status.pop(uid, None)
-
-def _uid(message) -> int | None:
-    """Return user id, or None for channel posts / anonymous senders."""
-    return message.from_user.id if message.from_user else None
-
-
-# ══════════════════════════════════════════════════════════════
-#  DEDUP  (FIX #16 — correct eviction order)
-#
-#  v2 BUG:  eviction checked _seen_deque[0] AFTER append.
-#           When deque (maxlen=500) is full, append auto-pops
-#           the OLDEST item from the deque. So _seen_deque[0]
-#           after append is the 2nd-oldest — wrong key discarded
-#           from _seen_set → set could grow unbounded.
-#
-#  v3 FIX:  check len BEFORE append. If deque is full, grab
-#           the item that WILL be evicted (index 0), remove it
-#           from the set, THEN append the new key.
-# ══════════════════════════════════════════════════════════════
-_seen_set:       set               = set()
-_seen_deque:     deque             = deque(maxlen=500)
-_seen_lock_obj:  asyncio.Lock | None = None
-
-def _get_seen_lock() -> asyncio.Lock:
-    global _seen_lock_obj
-    if _seen_lock_obj is None:
-        _seen_lock_obj = asyncio.Lock()
-    return _seen_lock_obj
-
-async def _dedup(message) -> bool:
-    """Returns True if this exact message was already processed."""
-    key = (message.chat.id, message.id)
-    async with _get_seen_lock():
-        if key in _seen_set:
-            return True
-        # FIX #16 — evict the item that WILL be auto-popped BEFORE appending
-        if len(_seen_deque) == _seen_deque.maxlen:
-            _seen_set.discard(_seen_deque[0])  # this is the one about to leave
-        _seen_set.add(key)
-        _seen_deque.append(key)
-        return False
-
-
-# ══════════════════════════════════════════════════════════════
-#  PROGRESS ENGINE
-# ══════════════════════════════════════════════════════════════
-THROTTLE  = 0.5
-EMA_ALPHA = 0.35
-SPINNER   = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-
-_last_edit: dict[int, float] = {}
-_ema_speed: dict[int, float] = {}
-_spin_idx:  dict[int, int]   = {}
-_shown_pct: dict[int, float] = {}
-
-def _reset(uid: int) -> None:
-    for d in (_last_edit, _ema_speed, _spin_idx, _shown_pct):
-        d.pop(uid, None)
-
-def _sz(b: float) -> str:
-    b = max(0.0, b)  # guard negative
-    for u in ("B","KB","MB","GB"):
-        if b < 1024: return f"{b:.1f} {u}"
-        b /= 1024
-    return f"{b:.1f} TB"
-
-def _eta(s: float) -> str:
-    s = max(0.0, s)
-    if s >= 3600: return f"{int(s//3600)}h {int(s%3600//60)}m"
-    if s >= 60:   return f"{int(s//60)}m {int(s%60)}s"
-    return f"{int(s)}s"
-
-def _bar(pct: float, w: int = 20) -> str:
-    pct = max(0.0, min(100.0, pct))
-    n = int(pct / 100 * w)
-    return "[" + "█" * n + "░" * (w - n) + "]"
-
-def _badge(pct: float) -> str:
-    return ("🏁" if pct>=100 else "🔥" if pct>=80 else
-            "⚡" if pct>=60 else "🚀" if pct>=40 else
-            "💫" if pct>=20 else "🌀")
-
-def _count_up(uid: int, real: float, step: float = 1.8) -> float:
-    prev  = _shown_pct.get(uid, 0.0)
-    shown = min(real, prev + step) if real > prev else real
-    _shown_pct[uid] = shown
-    return shown
-
-async def _safe_edit(msg, text: str) -> None:
     try:
-        await msg.edit(text)
-    except FloodWait as e:
-        await asyncio.sleep(e.value + 0.5)
-        try: await msg.edit(text)
-        except: pass
-    except MessageNotModified:
-        pass
+        target_id, count = int(context.args[0]), int(context.args[1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /addcredit <user_id> <count>")
+        return
+    await db.add_bonus_credits(target_id, count)
+    await update.message.reply_text(f"✅ {count} bonus credits diye user {target_id} ko.")
+    try:
+        await context.bot.send_message(target_id, f"🎁 Admin ne tumhe {count} bonus videos diye hain aaj ke liye!")
     except Exception:
         pass
 
-async def progress(current, total, msg, start, uid: int = 0,
-                   mode: str = "📥 Download") -> None:
-    if not isinstance(total, (int, float)) or total <= 0: return
-    if _get_cancel(uid).is_set(): return
-    now     = time.time()
-    elapsed = max(now - start, 0.001)
-    if now - _last_edit.get(uid, 0.0) < THROTTLE and _last_edit.get(uid, 0.0) != 0.0:
+
+async def allow4gb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    _last_edit[uid] = now
-    raw   = current / elapsed
-    ema   = EMA_ALPHA * raw + (1 - EMA_ALPHA) * _ema_speed.get(uid, raw)
-    _ema_speed[uid] = ema
-    eta_s = (total - current) / ema if ema > 0 else 0
-    real  = current * 100 / total
-    shown = _count_up(uid, real)
-    spin  = SPINNER[_spin_idx.get(uid, 0) % len(SPINNER)]
-    _spin_idx[uid] = _spin_idx.get(uid, 0) + 1
-    kb    = ema / 1024
-    tier  = "🟢 Fast" if kb >= 1024 else ("🟡 Good" if kb >= 256 else "🔴 Slow")
-    await _safe_edit(msg,
-        f"{spin} **{mode}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_bar(shown)}\n"
-        f"  {_badge(shown)} **{shown:.1f}%** ·  {_sz(current)} / {_sz(total)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  🚄 **Speed** : `{_sz(ema)}/s`  {tier}\n"
-        f"  ⏱ **ETA** : `{_eta(eta_s)}`\n"
-        f"  ⏳ **Elapsed** : `{_eta(elapsed)}`\n"
-        f"  ❌ /cancel to stop"
-    )
-
-async def upload_progress(current, total, msg, start, uid: int = 0) -> None:
-    await progress(current, total, msg, start, uid=uid, mode="⬆️ Upload")
-
-
-# ══════════════════════════════════════════════════════════════
-#  FFMPEG HELPERS
-#  FIX #18 — proc.wait() after every proc.kill() to reap zombies
-# ══════════════════════════════════════════════════════════════
-async def _kill_proc(proc) -> None:
-    """Kill a subprocess and wait for it to avoid zombie processes."""
     try:
-        proc.kill()
-    except ProcessLookupError:
-        pass  # already dead
+        target_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /allow4gb <user_id>")
+        return
+    await db.set_max_file_size(target_id, 4 * 1024 ** 3)
+    await update.message.reply_text(f"✅ User {target_id} ab 4GB tak upload/download kar sakta hai.")
+
+
+async def revoke4gb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
     try:
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except asyncio.TimeoutError:
-        pass  # best effort
-
-async def ffmpeg_cut(inp: str, out: str, ss: float, t: float) -> bool:
-    """Cut a video segment. Returns True on success."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-ss", str(ss), "-i", inp,
-            "-t", str(t), "-c", "copy", "-avoid_negative_ts", "make_zero", out,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            _, stderr_data = await asyncio.wait_for(
-                proc.communicate(), timeout=FFMPEG_CUT_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            await _kill_proc(proc)  # FIX #18
-            log.error(f"ffmpeg_cut timed out ({FFMPEG_CUT_TIMEOUT}s): {inp}")
-            return False
-        if proc.returncode != 0:
-            log.error(f"ffmpeg_cut rc={proc.returncode}: {stderr_data.decode()[-400:]}")
-        return proc.returncode == 0
-    except Exception as e:
-        log.error(f"ffmpeg_cut exception: {e}")
-        return False
-
-async def make_thumb(video: str, ss: float, out: str) -> str | None:
-    """Generate thumbnail image. Returns path or None."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-ss", str(ss), "-i", video,
-            "-vframes", "1", "-q:v", "2", "-vf", "scale=320:-1", out,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=THUMB_TIMEOUT)
-        except asyncio.TimeoutError:
-            await _kill_proc(proc)  # FIX #18
-            return None
-        return out if os.path.exists(out) else None
-    except Exception:
-        return None
-
-async def get_duration(file: str) -> float | None:
-    """Get video duration in seconds. Returns None on failure."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", file,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            out, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=FFPROBE_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            await _kill_proc(proc)  # FIX #18
-            log.error(f"ffprobe timed out: {file}")
-            return None
-        raw = out.decode().strip()
-        return float(raw) if raw and raw != "N/A" else None
-    except Exception:
-        return None
+        target_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /revoke4gb <user_id>")
+        return
+    await db.set_max_file_size(target_id, 2 * 1024 ** 3)
+    await update.message.reply_text(f"✅ User {target_id} wapas 2GB limit pe.")
 
 
-# ══════════════════════════════════════════════════════════════
-#  SPLIT UI
-# ══════════════════════════════════════════════════════════════
-async def _split_update(msg, done: int, total: int, note: str = "") -> None:
-    pct = (done * 100 // total) if total > 0 else 0
-    note_line = f"\n  ┗ _{note}_" if note else ""
-    await _safe_edit(msg,
-        f"✂️ **Splitting…**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_bar(pct, 16)} **{pct}%**\n"
-        f"  Part **{done}** / **{total}** done{note_line}\n"
-        f"  ❌ /cancel to stop"
-    )
+# ---------------- appeal system ----------------
 
+async def appeal_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, source_url = query.data.split("|", 1)
+    user_id = query.from_user.id
 
-# ══════════════════════════════════════════════════════════════
-#  UPLOAD PART
-# ══════════════════════════════════════════════════════════════
-async def _upload_part(message, path: str, num: int, total: int,
-                       uid: int, thumb_time: float) -> bool:
-    if _get_cancel(uid).is_set(): return False
-
-    # FIX #21 — reject 0-byte or tiny part files before even trying to upload
-    part_size = os.path.getsize(path) if os.path.exists(path) else 0
-    if part_size < MIN_PART_BYTES:
-        log.error(f"Part {num} is too small ({part_size} bytes) — skipping upload.")
-        return False
-
-    try:
-        status = await message.reply(
-            f"⬆️ **Upload** — part {num}/{total}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"[░░░░░░░░░░░░░░░░░░░░]\n"
-            f"  🌀 **0%** ·  starting…"
-        )
-    except Exception as e:
-        log.error(f"Could not send upload status for part {num}: {e}")
-        return False
-
-    _reset(uid)
-    t0 = time.time()
-    thumb_path = f"{THUMB_DIR}/thumb_{uid}_{num}.jpg"
-    thumb = await make_thumb(path, thumb_time, thumb_path)
-    uploaded = False
-
-    for attempt in range(2):  # max 1 FloodWait retry, never retry on other errors
-        if _get_cancel(uid).is_set():
-            await _safe_edit(status, "🚫 Upload cancelled.")
-            break
-        try:
-            await message.reply_video(
-                path,
-                caption=f"🎬 **Part {num} / {total}**",
-                thumb=thumb,
-                progress=upload_progress,
-                progress_args=(status, t0, uid),
-            )
-            uploaded = True
-            break  # ✅ NEVER retry after success — prevents double upload
-
-        except FloodWait as e:
-            # Safe to retry: FloodWait means Telegram rejected before storing
-            wait = e.value + 2
-            await _safe_edit(status,
-                f"⏳ **Flood wait** — part {num}/{total}\n"
-                f"  Resuming in `{wait}s`…"
-            )
-            await asyncio.sleep(wait)
-
-        except Exception as e:
-            # ⚠️ NEVER RETRY — file may already have been sent to Telegram
-            # ServerError, RPCError, network errors etc — all treated as no-retry
-            log.error(f"Upload part {num} (no retry): {e}")
-            await _safe_edit(status, f"❌ Upload failed part {num}: `{e}`")
-            break
-
-    _reset(uid)
-    if thumb and os.path.exists(thumb_path):
-        try: os.remove(thumb_path)
-        except: pass
-    try: await status.delete()
-    except: pass
-    return uploaded
-
-
-# ══════════════════════════════════════════════════════════════
-#  CORE SPLIT ENGINE
-#  FIX #20 — duration re-fetched inside lock to avoid mismatch
-#            when user sends a new video during get_duration call
-# ══════════════════════════════════════════════════════════════
-async def _do_split(message, uid: int, parts: int,
-                    seg_override: float | None = None,
-                    label: str = "") -> None:
-    """
-    seg_override: if given, use as segment length (splitmin/splitsize).
-                  If None, compute as dur/parts (split N).
-    """
-    # Re-validate + re-fetch duration INSIDE the lock
-    file = user_files.get(uid)
-    if not file or not os.path.exists(file):
-        await message.reply("❌ File mil nahi rahi. Dobara video bhejo!")
+    appeal_count = await db.get_appeal_count_today(user_id)
+    if appeal_count >= 3:
+        await query.edit_message_text("❌ Aaj ke appeal limit (3) khatam ho gaye. Kal try karo.")
         return
 
-    dur = await get_duration(file)
-    if not dur:
-        await message.reply("❌ Video duration nahi mila (inside lock).")
+    await db.increment_appeal_count(user_id)
+    review_id = await db.create_review_request(user_id, source_url, "User disputed automatic rejection")
+
+    await query.edit_message_text("📨 Tera appeal admin ko bhej diya gaya hai. Review hone tak wait karo.")
+
+    for admin_id in ADMIN_IDS:
+        try:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"radm|{review_id}|approve"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"radm|{review_id}|reject"),
+            ]])
+            await context.bot.send_message(
+                admin_id,
+                f"🔍 Appeal Review #{review_id}\nUser: {user_id}\nSource: {source_url}\n"
+                f"Bot's original reason: content flagged automatically",
+                reply_markup=kb,
+            )
+        except Exception:
+            logger.warning(f"Could not notify admin {admin_id}")
+
+
+async def admin_review_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Sirf admin ke liye.", show_alert=True)
+        return
+    await query.answer()
+
+    _, review_id, decision = query.data.split("|")
+    review_id = int(review_id)
+    review = await db.get_review(review_id)
+    if not review:
+        await query.edit_message_text("Review not found (already handled?).")
         return
 
-    seg = seg_override if seg_override is not None else dur / parts
+    _, user_id, source_url, reason, status = review
+    if status != "pending":
+        await query.edit_message_text(f"Already handled: {status}")
+        return
 
-    cancel = _get_cancel(uid)
-    cancel.clear()
-    msg = await message.reply(
-        f"✂️ **{label}**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{_bar(0, 16)} **0%**\n"
-        f"  ❌ /cancel to stop"
-    )
+    if decision == "approve":
+        await db.set_review_status(review_id, "approved")
+        await query.edit_message_text(f"✅ Approved review #{review_id}.")
+        await context.bot.send_message(
+            user_id, "✅ Admin ne approve kar diya! Video ab process ho raha hai..."
+        )
+        await process_video_job(context, user_id, source_url)
+    else:
+        await db.set_review_status(review_id, "rejected")
+        await query.edit_message_text(f"❌ Rejected review #{review_id}.")
+        await context.bot.send_message(
+            user_id, "❌ Admin ne bhi confirm kiya — ye content process nahi ho sakta."
+        )
+
+
+# ---------------- feedback buttons ----------------
+
+async def feedback_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Dhanyawaad!")
+    _, clip_id, value = query.data.split("|")
+    await db.set_clip_feedback(clip_id, int(value))
+
+
+# ---------------- core pipeline ----------------
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not text.startswith("http"):
+        await update.message.reply_text("Ye valid link nahi lag raha. YouTube/Instagram/TikTok/Facebook link bhejo.")
+        return
+
+    if user_id in active_jobs:
+        await update.message.reply_text("⏳ Tera pehle se ek video process ho raha hai. Uske complete hone ka wait karo.")
+        return
+
+    if not await db.can_process(user_id, FREE_DAILY_LIMIT):
+        await update.message.reply_text(
+            "🚫 Aaj ka free limit (5 videos) khatam ho gaya. Kal try karo ya admin se bonus credit maango."
+        )
+        return
+
+    await process_video_job(context, user_id, text, status_message=update.message)
+
+
+async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, source_url: str, status_message=None):
+    active_jobs.add(user_id)
+    job_id = uuid.uuid4().hex[:12]
+    video_path = None
+    audio_path = None
+
+    async def send_status(text):
+        if status_message:
+            return await status_message.reply_text(text)
+        return await context.bot.send_message(user_id, text)
+
     try:
-        for i in range(parts):
-            if cancel.is_set():
-                await _safe_edit(msg,
-                    f"🚫 **Cancelled!**\n  Stopped after **{i}** / **{parts}** parts.")
-                _clear_status(uid)
-                return
-            ss = i * seg
-            _set_status(uid, "Splitting", f"part {i+1}/{parts}")
-            await _split_update(msg, i, parts, f"cutting {i+1}/{parts}…")
-            out = f"{DOWNLOAD_DIR}/part_{uid}_{i+1}.mp4"
-            ok  = await ffmpeg_cut(file, out, ss, seg)
-            if not ok or not os.path.exists(out):
-                await _safe_edit(msg, f"❌ ffmpeg failed on part {i+1}. Check logs.")
-                _clear_status(uid)
-                return
-            _set_status(uid, "Uploading", f"part {i+1}/{parts}")
-            uploaded = await _upload_part(message, out, i+1, parts, uid, ss + seg/2)
+        await db.create_job(job_id, user_id, source_url)
+
+        status_msg = await send_status("🔎 Video check kar raha hoon...")
+
+        # --- pre-download validation ---
+        meta = await downloader.probe_metadata(source_url)
+        dur_check = safety.check_duration(meta["duration"], MAX_VIDEO_SECONDS)
+        if not dur_check["ok"]:
+            await status_msg.edit_text(f"❌ {dur_check['reason']}")
+            await db.update_job_status(job_id, "rejected")
+            return
+
+        safety_check = safety.check_metadata_safety(meta["title"], meta["description"])
+        if not safety_check["safe"]:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⚠️ Galat laga? Admin ko batao", callback_data=f"appeal|{source_url}")
+            ]])
+            await status_msg.edit_text(
+                f"❌ Ye content policy ke against lag raha hai: {safety_check['reason']}\n"
+                "Agar galat laga hai toh niche button se admin ko bata sakte ho.",
+                reply_markup=kb,
+            )
+            await db.update_job_status(job_id, "rejected")
+            return
+
+        # --- download (with caching) ---
+        url_hash = downloader.url_hash(source_url)
+        cached = await db.get_cached_download(url_hash)
+
+        await status_msg.edit_text("📥 Downloading video...")
+        if cached and os.path.exists(cached[0]):
+            video_path = cached[0]
+        else:
+            video_path = await downloader.download_best_quality(source_url, job_id)
+
+        await db.update_job_status(job_id, "processing")
+
+        # --- transcription ---
+        await status_msg.edit_text("🎙️ Transcribing audio...")
+        audio_path = os.path.join("downloads", f"{job_id}_audio.wav")
+        await clipper.extract_audio(video_path, audio_path)
+
+        if cached and cached[1]:
+            import json as _json
+            transcript = _json.loads(cached[1])
+        else:
+            transcript = await ai_analysis.transcribe(audio_path)
+            import json as _json
+            await db.save_cached_download(url_hash, video_path, _json.dumps(transcript))
+
+        # --- AI analysis ---
+        await status_msg.edit_text("🧠 Analyzing for viral moments...")
+        candidate_clips = await ai_analysis.analyze_for_clips(transcript, MAX_CLIPS)
+
+        if not candidate_clips:
+            await status_msg.edit_text("😕 Koi high-value moment nahi mila is video mein.")
+            await db.update_job_status(job_id, "failed")
+            return
+
+        all_words = transcript.get("words", [])
+
+        # --- cut + render each clip ---
+        sent_count = 0
+        for i, c in enumerate(candidate_clips, 1):
+            await status_msg.edit_text(f"✂️ Cutting clip {i}/{len(candidate_clips)}...")
+
+            clip_words = [w for w in all_words if c["start_time"] - 1 <= w["start"] <= c["end_time"] + 1]
+
+            start = clipper.snap_to_word_boundary(c["start_time"], clip_words, is_start=True)
+            end = clipper.snap_to_word_boundary(c["end_time"], clip_words, is_start=False)
+
+            clip_id = f"{job_id}_{i}"
             try:
-                if os.path.exists(out): os.remove(out)
-            except: pass
-            if not uploaded:
-                await _safe_edit(msg,
-                    f"🚫 **Cancelled!**\n  Stopped after **{i+1}** / **{parts}** parts.")
-                _clear_status(uid)
-                return
+                out_path = await clipper.cut_and_render_clip(
+                    video_path, clip_id, start, end, clip_words, style="style_2"
+                )
+            except Exception as e:
+                logger.exception(f"Clip {i} render failed")
+                continue
 
-        # All parts done
-        try:
-            if os.path.exists(file): os.remove(file)
-        except: pass
-        user_files.pop(uid, None)
-        _clear_status(uid)
-        await _safe_edit(msg,
-            f"🏁 **All {parts} parts done!**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{_bar(100, 16)} **100%**\n"
-            f"  ✅ Complete — send next video!"
-        )
-        log.info(f"Split done uid={uid} parts={parts}")
+            await db.save_clip(
+                clip_id, job_id, out_path, c["virality_score"], c["reasoning"],
+                c["hook_text"], c["suggested_platform"], start, end,
+            )
+
+            caption = (
+                f"🔥 Virality Score: {c['virality_score']}/100\n"
+                f"💡 {c['reasoning']}\n"
+                f"📱 Best for: {c['suggested_platform']}\n"
+                f"⏱️ Original timestamp: {int(start//60)}:{int(start%60):02d}"
+            )
+            fb_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("👍", callback_data=f"fb|{clip_id}|1"),
+                InlineKeyboardButton("👎", callback_data=f"fb|{clip_id}|-1"),
+            ]])
+
+            with open(out_path, "rb") as vf:
+                await context.bot.send_video(user_id, vf, caption=caption, reply_markup=fb_kb)
+            sent_count += 1
+
+        await status_msg.edit_text(f"✅ Done! {sent_count} clips bhej diye.")
+        await db.update_job_status(job_id, "done")
+        await db.increment_usage(user_id)
 
     except Exception as e:
-        log.error(f"_do_split error uid={uid}: {traceback.format_exc()}")
-        _clear_status(uid)
-        await _safe_edit(msg, f"❌ Error: `{e}`")
+        logger.exception("Job failed")
+        await send_status(f"❌ Kuch galat ho gaya: {str(e)[:200]}\nDobara try karo.")
+        await db.update_job_status(job_id, "failed")
+
+    finally:
+        active_jobs.discard(user_id)
+        # cleanup temp files (keep original video cached, remove audio + subtitle temp files)
+        await cleanup_files(audio_path)
+        for f in os.listdir("clips"):
+            if f.endswith(".ass"):
+                await cleanup_files(os.path.join("clips", f))
 
 
-# ══════════════════════════════════════════════════════════════
-#  COMMAND LIST — defined before receive handler (FIX #3)
-# ══════════════════════════════════════════════════════════════
-COMMAND_LIST = [
-    "start", "help", "split", "splitmin", "splitsize",
-    "info",  "status", "cancel", "clear",
-]
+# ---------------- main ----------------
+
+async def post_init(application: Application):
+    await db.init_db()
+    logger.info("Database initialized.")
 
 
-# ══════════════════════════════════════════════════════════════
-#  COMMANDS
-# ══════════════════════════════════════════════════════════════
-@app.on_message(filters.command("start"), group=1)
-async def cmd_start(client, message):
-    if await _dedup(message): return
-    name = getattr(message.from_user, "first_name", "User") or "User"
-    await message.reply(
-        f"⚡ **ULTRA BOT v3** — ready!\n\n"
-        f"👋 Hey **{name}**!\n\n"
-        f"📤 Send any **video**, then:\n"
-        f"  • `/split 3`       — N equal parts\n"
-        f"  • `/splitmin 2`    — chunk every N minutes\n"
-        f"  • `/splitsize 500` — chunk every N MB\n\n"
-        f"🛠 Other commands:\n"
-        f"  • `/info`    — video details\n"
-        f"  • `/status`  — current task\n"
-        f"  • `/cancel`  — stop task\n"
-        f"  • `/clear`   — reset stuck state\n"
-        f"  • `/help`    — full help\n\n"
-        f"✨ Multi-user · Async ffmpeg · Auto thumbnails\n"
-        f"🔄 FloodWait safe · No crash · No double upload"
-    )
+# ---------------- health check server (for Render free Web Service) ----------------
+# Render free tier only supports Web Services, which need to respond to HTTP
+# requests to stay "alive". The actual bot runs on Telegram polling in the
+# main thread; this tiny Flask server just answers pings on the port Render
+# expects, on a separate thread, so Render doesn't consider the service dead.
 
-@app.on_message(filters.command("help"), group=1)
-async def cmd_help(client, message):
-    if await _dedup(message): return
-    await message.reply(
-        f"📖 **ULTRA BOT v3 — Help**\n\n"
-        f"**Step 1:** Koi bhi video send karo\n"
-        f"  _(MP4, MKV, AVI, MOV, WEBM, WMV, 3GP)_\n\n"
-        f"**Step 2:** Split command do:\n\n"
-        f"  `/split N`       → N equal parts  |  `/split 3`\n"
-        f"  `/splitmin N`    → N min chunks   |  `/splitmin 5`\n"
-        f"  `/splitsize N`   → N MB chunks    |  `/splitsize 500`\n\n"
-        f"**Utils:**\n"
-        f"  `/info`   → loaded video ki details\n"
-        f"  `/status` → kya chal raha hai\n"
-        f"  `/cancel` → rok do\n"
-        f"  `/clear`  → stuck state reset karo\n"
-    )
-
-@app.on_message(filters.command("info"), group=1)
-async def cmd_info(client, message):
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-    path = user_files.get(uid)
-    if not path or not os.path.exists(path):
-        return await message.reply("❌ Koi video load nahi hai.\nPehle video bhejo!")
-    d  = await get_duration(path)
-    sz = os.path.getsize(path)
-    opts = ""
-    if d:
-        for n in [2, 3, 4, 5]:
-            opts += f"  `/split {n}` → {n}×{_eta(d/n)}\n"
-    await message.reply(
-        f"📋 **File Info**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  📁 `{os.path.basename(path)}`\n"
-        f"  📦 `{_sz(sz)}`\n"
-        f"  🎬 `{_eta(d) if d else 'unknown'}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  💡 Split options:\n{opts}"
-        f"  👉 `/split N` · `/splitmin N` · `/splitsize N`"
-    )
-
-@app.on_message(filters.command("status"), group=1)
-async def cmd_status(client, message):
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-    info = user_status.get(uid)
-    if not _get_lock(uid).locked() or not info:
-        path = user_files.get(uid)
-        if path and os.path.exists(path):
-            return await message.reply(
-                f"💤 **Idle — Ready**\n"
-                f"  📁 `{os.path.basename(path)}`\n"
-                f"  📦 `{_sz(os.path.getsize(path))}`\n"
-                f"  👉 `/split N` · `/splitmin N`"
-            )
-        return await message.reply("💤 **Idle** — send a video!")
-    elapsed = _eta(time.time() - info["since"])
-    await message.reply(
-        f"⚙️ **Running…**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  📌 **Task** : `{info['task']}`\n"
-        f"  📝 **Detail** : `{info['detail']}`\n"
-        f"  ⏳ **Time** : `{elapsed}`\n\n"
-        f"  ❌ /cancel to stop"
-    )
-
-@app.on_message(filters.command("cancel"), group=1)
-async def cmd_cancel(client, message):
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-    if not _get_lock(uid).locked():
-        return await message.reply("💤 Koi task nahi chal raha.")
-    _get_cancel(uid).set()
-    await message.reply("🚫 **Cancel requested!**\nStopping at next checkpoint…")
-
-@app.on_message(filters.command("clear"), group=1)
-async def cmd_clear(message):
-    """Reset stuck user state without bot restart."""
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-    if _get_lock(uid).locked():
-        return await message.reply(
-            "⚠️ Task abhi chal raha hai.\n"
-            "Pehle `/cancel` karo, phir `/clear`."
-        )
-    path = user_files.pop(uid, None)
-    if path:
-        try: os.remove(path)
-        except: pass
-    _get_cancel(uid).clear()
-    _clear_status(uid)
-    _reset(uid)
-    await message.reply(
-        "🗑️ **State cleared!**\n"
-        "Sab kuch reset ho gaya.\n"
-        "Naya video bhejo 👇"
-    )
+health_app = Flask(__name__)
 
 
-# ══════════════════════════════════════════════════════════════
-#  RECEIVE VIDEO
-#  group=-1 ensures this runs BEFORE command handlers (group=1)
-#  ~filters.command(COMMAND_LIST) prevents overlap with commands
-# ══════════════════════════════════════════════════════════════
-@app.on_message(
-    filters.incoming & (filters.video | filters.document)
-    & ~filters.command(COMMAND_LIST),
-    group=-1,
-)
-async def receive(client, message):
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Task running.\n👉 /status · /cancel")
-
-    media = message.document or message.video
-    if not media: return
-
-    mime      = getattr(media, "mime_type", "") or ""
-    file_size = getattr(media, "file_size", 0) or 0
-
-    # Filter: only accept video-like MIME types
-    if mime and not (mime.startswith("video/") or mime == "application/octet-stream"):
-        return
-
-    ext_map = {
-        "video/x-matroska": "mkv", "video/mkv": "mkv",
-        "video/avi":         "avi", "video/x-msvideo": "avi",
-        "video/webm":       "webm", "video/quicktime": "mov",
-        "video/x-ms-wmv":   "wmv", "video/3gpp": "3gp",
-    }
-    ext    = ext_map.get(mime, "mp4")
-    fname  = f"{DOWNLOAD_DIR}/video_{uid}_{message.id}.{ext}"
-    sz_str = _sz(file_size) if file_size else "?"
-
-    size_warn = ""
-    if file_size and file_size > MAX_FILE_WARN:
-        size_warn = f"\n  ⚠️ File `{sz_str}` — near Telegram 2 GB limit!"
-
-    # FIX double message: acquire lock BEFORE sending status reply
-    # so only one task ever starts the download for this user
-    if lock.locked():
-        return  # silently drop — first task already handling it
-    async with lock:
-        status = await message.reply(
-            f"📥 **Downloading…** `{ext.upper()}` · {sz_str}{size_warn}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏳ Starting…"
-        )
-
-        old_path = user_files.pop(uid, None)
-        if old_path and os.path.exists(old_path):
-            try: os.remove(old_path)
-            except: pass
-
-        _get_cancel(uid).clear()
-        _reset(uid)
-        _set_status(uid, "Downloading", sz_str)
-        t0 = time.time()
-
-        try:
-            path = await message.download(
-                file_name=fname,
-                progress=progress,
-                progress_args=(status, t0, uid, "📥 Download"),
-            )
-        except Exception as e:
-            _clear_status(uid)
-            await _safe_edit(status, f"❌ Download failed: `{e}`")
-            return
-
-        if not path or not os.path.exists(path):
-            _clear_status(uid)
-            await _safe_edit(status, "❌ File not saved — try again.")
-            return
-
-        _reset(uid)
-        _clear_status(uid)
-        user_files[uid] = path
-        await _safe_edit(status,
-            f"✅ **Download complete!**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"  📁 `{os.path.basename(path)}`\n"
-            f"  📦 {_sz(os.path.getsize(path))}  ·  ⏱ {_eta(time.time()-t0)}\n\n"
-            f"👉 `/split N`  ·  `/splitmin N`  ·  `/splitsize N`"
-        )
+@health_app.route("/")
+def health():
+    return "Bot is running.", 200
 
 
-# ══════════════════════════════════════════════════════════════
-#  SPLIT COMMANDS
-#  FIX #20 — duration re-fetched inside _do_split (inside lock)
-#            so the seg value is always consistent with the file
-# ══════════════════════════════════════════════════════════════
-def _is_ready(uid: int) -> bool:
-    path = user_files.get(uid)
-    return bool(path and os.path.exists(path))
-
-@app.on_message(filters.command("split"), group=1)
-async def cmd_split(client, message):
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
-    if not _is_ready(uid):
-        return await message.reply("❌ Pehle video bhejo!")
-    try:
-        parts = int(message.command[1])
-        assert 2 <= parts <= 100
-    except:
-        return await message.reply("❌ Usage: `/split 3`\n  Min 2, max 100.")
-    async with lock:
-        if not _is_ready(uid):
-            return await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
-        await _do_split(message, uid, parts,
-                        seg_override=None,
-                        label=f"Splitting into {parts} equal parts…")
-
-@app.on_message(filters.command("splitmin"), group=1)
-async def cmd_splitmin(client, message):
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
-    if not _is_ready(uid):
-        return await message.reply("❌ Pehle video bhejo!")
-    try:
-        mins = int(message.command[1])
-        assert 1 <= mins <= 120
-    except:
-        return await message.reply("❌ Usage: `/splitmin 2`\n  Minutes 1-120.")
-
-    # Quick pre-check (outside lock) — full check happens inside _do_split
-    dur_pre = await get_duration(user_files[uid])
-    if not dur_pre:
-        return await message.reply("❌ Video duration nahi mila.")
-    seg   = mins * 60
-    parts = math.ceil(dur_pre / seg)
-    if parts > 100:
-        return await message.reply(f"❌ Too many parts ({parts}). Bada chunk lo.")
-    if parts < 2:
-        return await message.reply(f"❌ Video {mins} min se chhota hai!")
-
-    async with lock:
-        if not _is_ready(uid):
-            return await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
-        await _do_split(message, uid, parts,
-                        seg_override=seg,
-                        label=f"{mins} min chunks → {parts} parts…")
-
-@app.on_message(filters.command("splitsize"), group=1)
-async def cmd_splitsize(client, message):
-    if await _dedup(message): return
-    uid = _uid(message)
-    if uid is None: return
-    lock = _get_lock(uid)
-    if lock.locked():
-        return await message.reply("⏳ Already processing.\n👉 /status · /cancel")
-    if not _is_ready(uid):
-        return await message.reply("❌ Pehle video bhejo!")
-    try:
-        mb = int(message.command[1])
-        assert 10 <= mb <= 2000
-    except:
-        return await message.reply("❌ Usage: `/splitsize 500`\n  MB 10-2000.")
-
-    file     = user_files[uid]
-    total_mb = os.path.getsize(file) / 1048576
-    dur_pre  = await get_duration(file)
-    if not dur_pre:
-        return await message.reply("❌ Video duration nahi mila.")
-    parts = math.ceil(total_mb / mb)
-    if parts > 100:
-        return await message.reply(f"❌ Too many parts ({parts}).")
-    if parts < 2:
-        return await message.reply(f"❌ File already ≤{mb}MB. Split ki zaroorat nahi.")
-    seg = dur_pre / parts
-
-    async with lock:
-        if not _is_ready(uid):
-            return await message.reply("❌ File mil nahi rahi. Dobara bhejo!")
-        await _do_split(message, uid, parts,
-                        seg_override=seg,
-                        label=f"{mb}MB chunks → {parts} parts…")
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    health_app.run(host="0.0.0.0", port=port)
 
 
-# ══════════════════════════════════════════════════════════════
+def main():
+    threading.Thread(target=run_health_server, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("myappeals", myappeals_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+
+    app.add_handler(CommandHandler("addcredit", addcredit_cmd))
+    app.add_handler(CommandHandler("allow4gb", allow4gb_cmd))
+    app.add_handler(CommandHandler("revoke4gb", revoke4gb_cmd))
+
+    app.add_handler(CallbackQueryHandler(appeal_button_cb, pattern=r"^appeal\|"))
+    app.add_handler(CallbackQueryHandler(admin_review_cb, pattern=r"^radm\|"))
+    app.add_handler(CallbackQueryHandler(feedback_cb, pattern=r"^fb\|"))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+    logger.info("Bot starting...")
+    app.run_polling()
+
+
 if __name__ == "__main__":
-    log.info("🚀 Ultra Bot v3 starting…")
-    app.run()
+    main()
+    
