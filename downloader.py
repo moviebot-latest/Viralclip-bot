@@ -54,6 +54,7 @@ async def probe_metadata(url: str) -> dict:
                 "description": info.get("description", "") or "",
                 "duration": info.get("duration", 0) or 0,
                 "id": info.get("id", ""),
+                "filesize_approx": info.get("filesize") or info.get("filesize_approx") or 0,
             }
 
     return await loop.run_in_executor(None, _probe)

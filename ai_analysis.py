@@ -36,19 +36,54 @@ async def transcribe(audio_path: str) -> dict:
     return await loop.run_in_executor(None, _transcribe)
 
 
-def _build_analysis_prompt(transcript_text: str, segments: list, max_clips: int) -> str:
+def _build_analysis_prompt(transcript_text: str, segments: list, max_clips: int,
+                            video_duration: float, platform: str = "both") -> str:
     segments_json = json.dumps(segments, ensure_ascii=False)
+
+    platform_line = {
+        "instagram": "Target platform: Instagram Reels. Prefer 15-60 second clips.",
+        "youtube": "Target platform: YouTube Shorts. Prefer 15-60 second clips (up to 90s is fine).",
+        "both": "Target platforms: Instagram Reels AND YouTube Shorts. Prefer 15-60 second clips.",
+    }.get(platform, "Target platforms: Instagram Reels and YouTube Shorts. Prefer 15-60 second clips.")
+
+    # If the source video itself is short (typical of reels/shorts already),
+    # a strict 15-60s-per-clip rule can leave nothing selectable. Relax the
+    # rule and allow the whole video (or most of it) as a single clip if it's
+    # high value, instead of forcing artificial sub-cuts.
+    if video_duration <= 75:
+        length_rule = (
+            f"This source video is only {video_duration:.0f} seconds long — shorter than "
+            "a typical clip target. In this case, do NOT force artificial 15-60s cuts. "
+            "Instead, evaluate the ENTIRE video (or the strongest continuous portion of it, "
+            "trimming only dead air/intro filler at the very start or end) as ONE clip if it "
+            "has genuine viral value. Return just 1 clip in that case. If the video has clearly "
+            "distinct segments each with independent value, you may return more than 1, but do "
+            "not invent boundaries that cut mid-thought just to hit a target length."
+        )
+    else:
+        length_rule = (
+            f"Select up to {max_clips} NON-OVERLAPPING segments, each a natural standalone "
+            "15-60 second viral moment."
+        )
+
     return f"""You are a viral short-form video editor analyzing a transcript to find
 the best moments for standalone vertical clips (Reels/Shorts/TikTok).
+
+Video duration: {video_duration:.0f} seconds.
+{platform_line}
 
 Full transcript segments with timestamps (start, end, text):
 {segments_json}
 
-Task: Select up to {max_clips} NON-OVERLAPPING segments that would work best as
-standalone 15-60 second viral clips. Each clip must:
+Task: {length_rule}
+
+Each clip must:
 - Start and end on natural sentence boundaries (use the given timestamps)
 - Contain a strong hook, emotional peak, controversial statement, punchline, or high-value insight
 - Make sense without the rest of the video for context
+
+Only return clips that are GENUINELY high-value. If truly nothing in this video has
+viral potential, it is fine to return an empty array — do not force weak selections.
 
 For each selected clip return JSON with:
 - start_time (float, seconds)
@@ -61,7 +96,8 @@ For each selected clip return JSON with:
 Respond ONLY with a JSON array of objects, no other text, no markdown fences."""
 
 
-async def analyze_for_clips(transcript: dict, max_clips: int = 10) -> list:
+async def analyze_for_clips(transcript: dict, max_clips: int = 10,
+                             video_duration: float = None, platform: str = "both") -> list:
     """
     Sends transcript segments to the LLM, gets back ranked, non-overlapping
     high-value clip candidates with reasoning.
@@ -71,9 +107,12 @@ async def analyze_for_clips(transcript: dict, max_clips: int = 10) -> list:
         {"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"].strip()}
         for s in segments
     ]
-    full_text = transcript.get("text", "")
 
-    prompt = _build_analysis_prompt(full_text, simplified, max_clips)
+    if video_duration is None:
+        video_duration = segments[-1]["end"] if segments else 0
+
+    prompt = _build_analysis_prompt(transcript.get("text", ""), simplified, max_clips,
+                                     video_duration, platform)
 
     loop = asyncio.get_event_loop()
 
@@ -112,5 +151,21 @@ async def analyze_for_clips(transcript: dict, max_clips: int = 10) -> list:
         if c["start_time"] >= last_end:
             filtered.append(c)
             last_end = c["end_time"]
+
+    # Fallback: for a short source video (already reel-length), if the LLM
+    # returned nothing at all, don't leave the user empty-handed — treat the
+    # whole clip as one candidate. This only fires for short sources, so it
+    # can't accidentally dump a full 1-hour video as "one clip".
+    if not filtered and video_duration and video_duration <= 75 and segments:
+        full_text_stripped = transcript.get("text", "").strip()
+        if full_text_stripped:
+            filtered = [{
+                "start_time": segments[0]["start"],
+                "end_time": segments[-1]["end"],
+                "virality_score": 55,
+                "reasoning": "Short source clip used as-is (below minimum segment length for sub-cutting).",
+                "hook_text": "Watch this",
+                "suggested_platform": "Instagram Reels" if platform == "instagram" else "YouTube Shorts",
+            }]
 
     return filtered[:max_clips]

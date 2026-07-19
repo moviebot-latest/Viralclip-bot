@@ -47,6 +47,13 @@ FREE_DAILY_LIMIT = 5
 MAX_CLIPS = 10
 MAX_VIDEO_SECONDS = 2 * 3600  # 2 hour cap, Phase 1
 
+# Processing safety cutoff (separate from the 2GB/4GB Bot API *upload* limit).
+# Normal users: up to 1GB processed. Admin-approved 4GB users: up to 4GB.
+# Free Render tier hardware (512MB RAM, 0.1 CPU) may still be slow/unstable
+# near these ceilings — raise if you upgrade Render's plan.
+NORMAL_SAFE_PROCESSING_BYTES = 1 * 1024 ** 3       # 1GB
+ADMIN_SAFE_PROCESSING_BYTES = 4 * 1024 ** 3        # 4GB
+
 # Local Bot API server (raises Telegram's 20MB download / 50MB upload caps to 2GB).
 # Set LOCAL_BOT_API_URL to your deployed telegram-bot-api service, e.g.
 # "https://your-bot-api-server.onrender.com". Leave unset to use api.telegram.org.
@@ -57,6 +64,10 @@ logger = logging.getLogger(__name__)
 
 # tracks users with an active job right now (in-memory, per-process)
 active_jobs = set()
+
+# tracks a job waiting on the user's platform choice: user_id -> job spec dict
+# spec = {"source_url": ..., "local_video_path": ..., "status_message": Message}
+pending_platform_choice = {}
 
 
 # ---------------- helper ----------------
@@ -225,6 +236,27 @@ async def feedback_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.set_clip_feedback(clip_id, int(value))
 
 
+async def platform_choice_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    _, platform = query.data.split("|")
+
+    spec = pending_platform_choice.pop(user_id, None)
+    if spec is None:
+        await query.edit_message_text("Ye request expire ho gayi. Video/link dobara bhejo.")
+        return
+
+    label = {"instagram": "Instagram", "youtube": "YouTube", "both": "Instagram + YouTube"}[platform]
+    await query.edit_message_text(f"✅ {label} ke liye clips banayenge. Processing shuru...")
+
+    await process_video_job(
+        context, user_id, source_url=spec["source_url"],
+        status_message=query.message, local_video_path=spec["local_video_path"],
+        platform=platform,
+    )
+
+
 # ---------------- core pipeline ----------------
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,7 +277,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await process_video_job(context, user_id, text, status_message=update.message)
+    pending_platform_choice[user_id] = {"source_url": text, "local_video_path": None}
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📸 Instagram", callback_data="platform|instagram"),
+        InlineKeyboardButton("▶️ YouTube", callback_data="platform|youtube"),
+        InlineKeyboardButton("🔀 Dono", callback_data="platform|both"),
+    ]])
+    await update.message.reply_text(
+        "Kis platform ke liye clips chahiye?", reply_markup=kb
+    )
 
 
 async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -272,6 +312,20 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text(f"❌ File bahut badi hai. Tera limit {limit_gb:.0f}GB hai.")
         return
 
+    # Processing safety cutoff: normal users up to 1GB, admin-approved 4GB
+    # users up to 4GB. (Separate from the accept/upload limit above.)
+    is_4gb_user = max_size > 2 * 1024 ** 3
+    safe_limit = ADMIN_SAFE_PROCESSING_BYTES if is_4gb_user else NORMAL_SAFE_PROCESSING_BYTES
+
+    if tg_file.file_size and tg_file.file_size > safe_limit:
+        limit_mb = safe_limit / (1024 ** 2)
+        await msg.reply_text(
+            f"⚠️ Ye file abhi ke server resources ke liye bahut badi hai "
+            f"(current safe limit ~{limit_mb:.0f}MB). Chhoti video try karo, "
+            f"ya link bhejo (link se processing zyada stable hai)."
+        )
+        return
+
     status_msg = await msg.reply_text("📥 File download ho raha hai...")
 
     job_id = uuid.uuid4().hex[:12]
@@ -284,15 +338,18 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await status_msg.edit_text(f"❌ File download nahi ho payi: {str(e)[:150]}")
         return
 
-    await status_msg.edit_text("✅ File mil gayi, processing shuru...")
-    await process_video_job(
-        context, user_id, source_url=f"direct_upload:{tg_file.file_id}",
-        status_message=status_msg, local_video_path=local_path,
-    )
+    await status_msg.edit_text("✅ File mil gayi.")
+    pending_platform_choice[user_id] = {"source_url": f"direct_upload:{tg_file.file_id}", "local_video_path": local_path}
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📸 Instagram", callback_data="platform|instagram"),
+        InlineKeyboardButton("▶️ YouTube", callback_data="platform|youtube"),
+        InlineKeyboardButton("🔀 Dono", callback_data="platform|both"),
+    ]])
+    await status_msg.reply_text("Kis platform ke liye clips chahiye?", reply_markup=kb)
 
 
 async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, source_url: str,
-                             status_message=None, local_video_path: str = None):
+                             status_message=None, local_video_path: str = None, platform: str = "both"):
     active_jobs.add(user_id)
     job_id = uuid.uuid4().hex[:12]
     video_path = local_video_path
@@ -315,6 +372,21 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
             dur_check = safety.check_duration(meta["duration"], MAX_VIDEO_SECONDS)
             if not dur_check["ok"]:
                 await status_msg.edit_text(f"❌ {dur_check['reason']}")
+                await db.update_job_status(job_id, "rejected")
+                return
+
+            approx_size = meta.get("filesize_approx", 0)
+            user_max_size = await db.get_max_file_size(user_id)
+            is_4gb_user = user_max_size > 2 * 1024 ** 3
+            safe_limit = ADMIN_SAFE_PROCESSING_BYTES if is_4gb_user else NORMAL_SAFE_PROCESSING_BYTES
+
+            if approx_size and approx_size > safe_limit:
+                limit_mb = safe_limit / (1024 ** 2)
+                await status_msg.edit_text(
+                    f"⚠️ Ye video abhi ke server resources ke liye bahut badi hai "
+                    f"(~{approx_size/(1024**2):.0f}MB, safe limit ~{limit_mb:.0f}MB). "
+                    "Chhoti video try karo."
+                )
                 await db.update_job_status(job_id, "rejected")
                 return
 
@@ -370,7 +442,10 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
 
         # --- AI analysis ---
         await status_msg.edit_text("🧠 Analyzing for viral moments...")
-        candidate_clips = await ai_analysis.analyze_for_clips(transcript, MAX_CLIPS)
+        video_duration = await clipper.get_video_duration(video_path)
+        candidate_clips = await ai_analysis.analyze_for_clips(
+            transcript, MAX_CLIPS, video_duration=video_duration, platform=platform
+        )
 
         if not candidate_clips:
             await status_msg.edit_text("😕 Koi high-value moment nahi mila is video mein.")
@@ -489,6 +564,7 @@ def main():
     app.add_handler(CallbackQueryHandler(appeal_button_cb, pattern=r"^appeal\|"))
     app.add_handler(CallbackQueryHandler(admin_review_cb, pattern=r"^radm\|"))
     app.add_handler(CallbackQueryHandler(feedback_cb, pattern=r"^fb\|"))
+    app.add_handler(CallbackQueryHandler(platform_choice_cb, pattern=r"^platform\|"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video_upload))

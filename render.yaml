@@ -1,15 +1,22 @@
 services:
   - type: web
-    name: telegram-bot-api-server
-    env: docker
-    dockerfilePath: ./Dockerfile
+    name: viralclip-bot
+    env: python
     plan: free
+    buildCommand: "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
+    startCommand: "python bot.py"
     envVars:
-      - key: TELEGRAM_API_ID
+      - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_API_HASH
+      - key: GROQ_API_KEY
         sync: false
-    disk:
-      name: bot-api-data
-      mountPath: /data
-      sizeGB: 1
+      - key: ADMIN_IDS
+        sync: false
+      - key: PORT
+        value: 10000
+# NOTE: Render free Web Services have NO persistent disk and sleep after
+# 15 min of no HTTP traffic. downloads/ and clips/ folders will just live
+# on local ephemeral storage and get wiped on every restart/sleep — that's
+# fine since we clean up temp files after each job anyway.
+# To prevent sleep, ping the root URL every ~10 min with an external
+# uptime service (e.g. UptimeRobot) pointed at your Render URL.
