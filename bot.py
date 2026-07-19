@@ -439,18 +439,31 @@ async def process_video_job(client, user_id: int, source_url: str,
 
         await db.update_job_status(job_id, "processing")
 
-        await status_msg.edit_text("🎙️ Transcribing audio...")
+        # Get duration early so we can show a rough total-time estimate to the user
+        video_duration = await clipper.get_video_duration(video_path)
+        est_total_min = max(2, round(video_duration / 60 * 0.5) + 2)  # rough: ~30% of video length + fixed overhead
+        job_start_time = time.time()
+
+        await status_msg.edit_text(
+            f"🎙️ Transcribing audio...\n"
+            f"(video: {int(video_duration//60)}m {int(video_duration%60)}s · "
+            f"est. total time: ~{est_total_min} min)"
+        )
         audio_path = os.path.join("downloads", f"{job_id}_audio.flac")
         await clipper.extract_audio(video_path, audio_path)
 
+        transcribe_start = time.time()
         if cached_transcript:
             transcript = json.loads(cached_transcript)
         else:
             transcript = await ai_analysis.transcribe(audio_path)
             await db.save_cached_download(url_hash, video_path, json.dumps(transcript))
+        transcribe_elapsed = time.time() - transcribe_start
 
-        await status_msg.edit_text("🧠 Analyzing for viral moments...")
-        video_duration = await clipper.get_video_duration(video_path)
+        await status_msg.edit_text(
+            f"🧠 Analyzing for viral moments...\n"
+            f"(transcription took {transcribe_elapsed:.0f}s)"
+        )
         candidate_clips = await ai_analysis.analyze_for_clips(
             transcript, MAX_CLIPS, video_duration=video_duration, platform=platform
         )
@@ -464,7 +477,11 @@ async def process_video_job(client, user_id: int, source_url: str,
 
         sent_count = 0
         for i, c in enumerate(candidate_clips, 1):
-            await status_msg.edit_text(f"✂️ Cutting clip {i}/{len(candidate_clips)}...")
+            elapsed_min = (time.time() - job_start_time) / 60
+            await status_msg.edit_text(
+                f"✂️ Cutting clip {i}/{len(candidate_clips)}...\n"
+                f"(elapsed: {elapsed_min:.1f} min)"
+            )
 
             clip_words = [w for w in all_words if c["start_time"] - 1 <= w["start"] <= c["end_time"] + 1]
             start = clipper.snap_to_word_boundary(c["start_time"], clip_words, is_start=True)
@@ -517,7 +534,11 @@ async def process_video_job(client, user_id: int, source_url: str,
             except Exception:
                 logger.exception(f"Clip {i} upload failed")
 
-        await status_msg.edit_text(f"✅ Done! {sent_count} clips bhej diye.")
+        total_elapsed_min = (time.time() - job_start_time) / 60
+        await status_msg.edit_text(
+            f"✅ Done! {sent_count} clips bhej diye.\n"
+            f"(total time: {total_elapsed_min:.1f} min)"
+        )
         await db.update_job_status(job_id, "done")
         await db.increment_usage(user_id)
 
