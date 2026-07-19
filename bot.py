@@ -440,7 +440,7 @@ async def process_video_job(client, user_id: int, source_url: str,
         await db.update_job_status(job_id, "processing")
 
         await status_msg.edit_text("🎙️ Transcribing audio...")
-        audio_path = os.path.join("downloads", f"{job_id}_audio.wav")
+        audio_path = os.path.join("downloads", f"{job_id}_audio.flac")
         await clipper.extract_audio(video_path, audio_path)
 
         if cached_transcript:

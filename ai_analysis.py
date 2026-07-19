@@ -16,24 +16,50 @@ WHISPER_MODEL = "whisper-large-v3"
 LLM_MODEL = "llama-3.3-70b-versatile"
 
 
+GROQ_FILE_SIZE_LIMIT = 25 * 1024 * 1024  # ~25MB, Groq's request size ceiling
+
+
 async def transcribe(audio_path: str) -> dict:
     """
     Returns Groq verbose_json transcript with word-level timestamps.
     Groq auto-detects language; Hindi/English/mixed all supported.
+
+    If the audio file exceeds Groq's ~25MB request limit (can happen on
+    long videos even with FLAC), we re-compress to a lower-bitrate mono MP3
+    before retrying, rather than failing with a 413 error.
     """
     loop = asyncio.get_event_loop()
 
-    def _transcribe():
-        with open(audio_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                file=(os.path.basename(audio_path), f.read()),
-                model=WHISPER_MODEL,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-            )
+    def _read_and_call(path):
+        with open(path, "rb") as f:
+            data = f.read()
+        result = client.audio.transcriptions.create(
+            file=(os.path.basename(path), data),
+            model=WHISPER_MODEL,
+            response_format="verbose_json",
+            timestamp_granularities=["word", "segment"],
+        )
         return result.model_dump() if hasattr(result, "model_dump") else dict(result)
 
-    return await loop.run_in_executor(None, _transcribe)
+    file_size = os.path.getsize(audio_path)
+    if file_size <= GROQ_FILE_SIZE_LIMIT:
+        return await loop.run_in_executor(None, _read_and_call, audio_path)
+
+    # Too large even as FLAC — re-compress to low-bitrate mono MP3 (32kbps is
+    # plenty for speech-to-text) and retry once.
+    compressed_path = audio_path.rsplit(".", 1)[0] + "_compressed.mp3"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", audio_path,
+        "-ar", "16000", "-ac", "1", "-b:a", "32k", compressed_path,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+
+    try:
+        return await loop.run_in_executor(None, _read_and_call, compressed_path)
+    finally:
+        if os.path.exists(compressed_path):
+            os.remove(compressed_path)
 
 
 def _build_analysis_prompt(transcript_text: str, segments: list, max_clips: int,

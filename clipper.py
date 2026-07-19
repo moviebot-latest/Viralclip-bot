@@ -33,9 +33,16 @@ async def _run(cmd: list):
 
 
 async def extract_audio(video_path: str, out_path: str):
+    """
+    Extracts audio as compressed FLAC (16kHz mono) instead of raw PCM WAV.
+    Groq's Whisper API has a ~25MB request size limit — a 22-min raw PCM WAV
+    can easily exceed 40MB, causing a 413 "Request Entity Too Large" error.
+    FLAC is lossless but compressed, cutting file size roughly in half while
+    keeping transcription quality identical.
+    """
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        "-vn", "-acodec", "flac", "-ar", "16000", "-ac", "1",
         out_path,
     ]
     await _run(cmd)
