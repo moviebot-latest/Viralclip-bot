@@ -12,9 +12,18 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
       - key: PORT
         value: 10000
-# NOTE: Render free Web Services have NO persistent disk and sleep after
+# NOTE: Bot now runs on Pyrogram (MTProto) instead of python-telegram-bot
+# (Bot API), so it needs TELEGRAM_API_ID and TELEGRAM_API_HASH (from
+# my.telegram.org) directly — no separate Local Bot API Server needed
+# anymore. Pyrogram handles 2GB/4GB file download/upload natively.
+#
+# Render free Web Services have NO persistent disk and sleep after
 # 15 min of no HTTP traffic. downloads/ and clips/ folders will just live
 # on local ephemeral storage and get wiped on every restart/sleep — that's
 # fine since we clean up temp files after each job anyway.

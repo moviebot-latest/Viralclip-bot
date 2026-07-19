@@ -1,37 +1,32 @@
 """
-bot.py
+bot.py — Pyrogram edition
 Main Telegram bot entrypoint. Orchestrates the full pipeline:
 link -> validate -> download -> transcribe -> analyze -> cut/caption -> send
 
-Phase 1 scope (working end-to-end):
-  - /start, /history, /myappeals, /status
-  - Link handling with pre-download validation + safety check
-  - Daily free limit (5/day) + admin bonus credits
-  - File size tiers (2GB default / 4GB admin-approved)
-  - 1 concurrent job per user
-  - Live status updates
-  - Word-boundary-safe clipping + smart crop + captions
-  - Virality score + reasoning + hook + platform suggestion in output
-  - Appeal system (user disputes a rejection -> admin approves/rejects)
-  - Temp file cleanup
-  - Download caching (same URL reused)
+Switched from python-telegram-bot (Bot API) to Pyrogram (MTProto client) for
+reliable large-file download/upload with real byte-level progress, without
+needing a separately-hosted Local Bot API Server.
+
+File size tiers:
+  - Normal user: 2GB
+  - Admin-approved (/allow4gb): 2GB extra = 4GB total
 
 Admin commands: /addcredit, /allow4gb, /revoke4gb, review approve/reject buttons
 """
 
 import os
 import uuid
+import time
+import json
 import logging
 import asyncio
-import threading
+from threading import Thread
 from dotenv import load_dotenv
 from flask import Flask
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters,
-)
+from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import database as db
 import downloader
@@ -41,36 +36,30 @@ import clipper
 
 load_dotenv()
 
+API_ID = int(os.environ["TELEGRAM_API_ID"])
+API_HASH = os.environ["TELEGRAM_API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x}
 FREE_DAILY_LIMIT = 5
 MAX_CLIPS = 10
 MAX_VIDEO_SECONDS = 2 * 3600  # 2 hour cap, Phase 1
 
-# Processing safety cutoff (separate from the 2GB/4GB Bot API *upload* limit).
-# Normal users: up to 1GB processed. Admin-approved 4GB users: up to 4GB.
-# Free Render tier hardware (512MB RAM, 0.1 CPU) may still be slow/unstable
-# near these ceilings — raise if you upgrade Render's plan.
-NORMAL_SAFE_PROCESSING_BYTES = 1 * 1024 ** 3       # 1GB
-ADMIN_SAFE_PROCESSING_BYTES = 4 * 1024 ** 3        # 4GB
-
-# Local Bot API server (raises Telegram's 20MB download / 50MB upload caps to 2GB).
-# Set LOCAL_BOT_API_URL to your deployed telegram-bot-api service, e.g.
-# "https://your-bot-api-server.onrender.com". Leave unset to use api.telegram.org.
-LOCAL_BOT_API_URL = os.environ.get("LOCAL_BOT_API_URL", "").rstrip("/")
+NORMAL_MAX_BYTES = 2 * 1024 ** 3  # 2GB
+ADMIN_MAX_BYTES = 4 * 1024 ** 3   # 2GB extra = 4GB total
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# tracks users with an active job right now (in-memory, per-process)
-active_jobs = set()
+app = Client(
+    "viralclip-bot",
+    api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+    in_memory=True,
+    sleep_threshold=300,
+)
 
-# tracks a job waiting on the user's platform choice: user_id -> job spec dict
-# spec = {"source_url": ..., "local_video_path": ..., "status_message": Message}
+active_jobs = set()
 pending_platform_choice = {}
 
-
-# ---------------- helper ----------------
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -85,97 +74,137 @@ async def cleanup_files(*paths):
             logger.warning(f"Could not remove {p}")
 
 
-# ---------------- basic commands ----------------
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Bhej de koi bhi YouTube/Instagram/TikTok/Facebook link ya video file — "
-        "main usme se best 10 viral clips nikaal ke dunga, hooks aur captions ke saath.\n\n"
-        "Free: 5 videos/day. Zyada chahiye toh admin se bonus credit maango.\n\n"
-        "⚠️ Disclaimer: content ki copyright responsibility tumhari hai, bot sirf ek tool hai."
-    )
+def platform_kb():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📸 Instagram", callback_data="platform|instagram"),
+        InlineKeyboardButton("▶️ YouTube", callback_data="platform|youtube"),
+        InlineKeyboardButton("🔀 Dono", callback_data="platform|both"),
+    ]])
 
 
-async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = await db.get_user_history(update.effective_user.id)
-    if not rows:
-        await update.message.reply_text("Abhi tak koi video process nahi hua.")
+_last_edit_time: dict[int, float] = {}
+EDIT_THROTTLE_SECONDS = 2.0
+
+
+def _fmt_size(b: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if b < 1024:
+            return f"{b:.1f}{unit}"
+        b /= 1024
+    return f"{b:.1f}TB"
+
+
+async def _progress_cb(current: int, total: int, status_msg, label: str, msg_key: int):
+    if not total:
         return
-    lines = [f"• {r[1][:40]}... — {r[3]} ({r[2][:16]})" for r in rows]
-    await update.message.reply_text("📜 Tera history:\n" + "\n".join(lines))
-
-
-async def myappeals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    count = await db.get_appeal_count_today(user_id)
-    await update.message.reply_text(f"Aaj ke appeals: {count}/3")
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"✅ Bot online.\nActive jobs abhi: {len(active_jobs)}"
-    )
-
-
-# ---------------- admin commands ----------------
-
-async def addcredit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    now = time.time()
+    last = _last_edit_time.get(msg_key, 0)
+    pct = current / total * 100
+    if pct < 100 and (now - last) < EDIT_THROTTLE_SECONDS:
         return
+    _last_edit_time[msg_key] = now
+    bar_len = 20
+    filled = int(pct / 100 * bar_len)
+    bar = "█" * filled + "░" * (bar_len - filled)
     try:
-        target_id, count = int(context.args[0]), int(context.args[1])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /addcredit <user_id> <count>")
-        return
-    await db.add_bonus_credits(target_id, count)
-    await update.message.reply_text(f"✅ {count} bonus credits diye user {target_id} ko.")
-    try:
-        await context.bot.send_message(target_id, f"🎁 Admin ne tumhe {count} bonus videos diye hain aaj ke liye!")
+        await status_msg.edit_text(
+            f"{label}\n[{bar}] {pct:.0f}%\n{_fmt_size(current)} / {_fmt_size(total)}"
+        )
     except Exception:
         pass
 
 
-async def allow4gb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+@app.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    await message.reply_text(
+        "👋 Bhej de koi bhi YouTube/Instagram/TikTok/Facebook link ya video file — "
+        "main usme se best 10 viral clips nikaal ke dunga, hooks aur captions ke saath.\n\n"
+        "Free: 5 videos/day, 2GB file size. Zyada chahiye toh admin se bonus credit maango.\n\n"
+        "⚠️ Disclaimer: content ki copyright responsibility tumhari hai, bot sirf ek tool hai."
+    )
+
+
+@app.on_message(filters.command("history"))
+async def history_cmd(client, message):
+    rows = await db.get_user_history(message.from_user.id)
+    if not rows:
+        await message.reply_text("Abhi tak koi video process nahi hua.")
+        return
+    lines = [f"• {r[1][:40]}... — {r[3]} ({r[2][:16]})" for r in rows]
+    await message.reply_text("📜 Tera history:\n" + "\n".join(lines))
+
+
+@app.on_message(filters.command("myappeals"))
+async def myappeals_cmd(client, message):
+    count = await db.get_appeal_count_today(message.from_user.id)
+    await message.reply_text(f"Aaj ke appeals: {count}/3")
+
+
+@app.on_message(filters.command("status"))
+async def status_cmd(client, message):
+    await message.reply_text(f"✅ Bot online.\nActive jobs abhi: {len(active_jobs)}")
+
+
+@app.on_message(filters.command("addcredit"))
+async def addcredit_cmd(client, message):
+    if not is_admin(message.from_user.id):
         return
     try:
-        target_id = int(context.args[0])
+        parts = message.text.split()
+        target_id, count = int(parts[1]), int(parts[2])
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /allow4gb <user_id>")
+        await message.reply_text("Usage: /addcredit <user_id> <count>")
         return
-    await db.set_max_file_size(target_id, 4 * 1024 ** 3)
-    await update.message.reply_text(f"✅ User {target_id} ab 4GB tak upload/download kar sakta hai.")
+    await db.add_bonus_credits(target_id, count)
+    await message.reply_text(f"✅ {count} bonus credits diye user {target_id} ko.")
+    try:
+        await client.send_message(target_id, f"🎁 Admin ne tumhe {count} bonus videos diye hain aaj ke liye!")
+    except Exception:
+        pass
 
 
-async def revoke4gb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+@app.on_message(filters.command("allow4gb"))
+async def allow4gb_cmd(client, message):
+    if not is_admin(message.from_user.id):
         return
     try:
-        target_id = int(context.args[0])
+        target_id = int(message.text.split()[1])
     except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /revoke4gb <user_id>")
+        await message.reply_text("Usage: /allow4gb <user_id>")
         return
-    await db.set_max_file_size(target_id, 2 * 1024 ** 3)
-    await update.message.reply_text(f"✅ User {target_id} wapas 2GB limit pe.")
+    await db.set_max_file_size(target_id, ADMIN_MAX_BYTES)
+    await message.reply_text(f"✅ User {target_id} ab 4GB (2GB extra) tak upload/download kar sakta hai.")
 
 
-# ---------------- appeal system ----------------
+@app.on_message(filters.command("revoke4gb"))
+async def revoke4gb_cmd(client, message):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        target_id = int(message.text.split()[1])
+    except (IndexError, ValueError):
+        await message.reply_text("Usage: /revoke4gb <user_id>")
+        return
+    await db.set_max_file_size(target_id, NORMAL_MAX_BYTES)
+    await message.reply_text(f"✅ User {target_id} wapas 2GB limit pe.")
 
-async def appeal_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    _, source_url = query.data.split("|", 1)
-    user_id = query.from_user.id
+
+@app.on_callback_query(filters.regex(r"^appeal\|"))
+async def appeal_button_cb(client, callback_query):
+    _, source_url = callback_query.data.split("|", 1)
+    user_id = callback_query.from_user.id
 
     appeal_count = await db.get_appeal_count_today(user_id)
     if appeal_count >= 3:
-        await query.edit_message_text("❌ Aaj ke appeal limit (3) khatam ho gaye. Kal try karo.")
+        await callback_query.answer()
+        await callback_query.edit_message_text("❌ Aaj ke appeal limit (3) khatam ho gaye. Kal try karo.")
         return
 
     await db.increment_appeal_count(user_id)
     review_id = await db.create_review_request(user_id, source_url, "User disputed automatic rejection")
 
-    await query.edit_message_text("📨 Tera appeal admin ko bhej diya gaya hai. Review hone tak wait karo.")
+    await callback_query.answer()
+    await callback_query.edit_message_text("📨 Tera appeal admin ko bhej diya gaya hai. Review hone tak wait karo.")
 
     for admin_id in ADMIN_IDS:
         try:
@@ -183,7 +212,7 @@ async def appeal_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("✅ Approve", callback_data=f"radm|{review_id}|approve"),
                 InlineKeyboardButton("❌ Reject", callback_data=f"radm|{review_id}|reject"),
             ]])
-            await context.bot.send_message(
+            await client.send_message(
                 admin_id,
                 f"🔍 Appeal Review #{review_id}\nUser: {user_id}\nSource: {source_url}\n"
                 f"Bot's original reason: content flagged automatically",
@@ -193,162 +222,146 @@ async def appeal_button_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Could not notify admin {admin_id}")
 
 
-async def admin_review_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not is_admin(query.from_user.id):
-        await query.answer("Sirf admin ke liye.", show_alert=True)
+@app.on_callback_query(filters.regex(r"^radm\|"))
+async def admin_review_cb(client, callback_query):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("Sirf admin ke liye.", show_alert=True)
         return
-    await query.answer()
+    await callback_query.answer()
 
-    _, review_id, decision = query.data.split("|")
+    _, review_id, decision = callback_query.data.split("|")
     review_id = int(review_id)
     review = await db.get_review(review_id)
     if not review:
-        await query.edit_message_text("Review not found (already handled?).")
+        await callback_query.edit_message_text("Review not found (already handled?).")
         return
 
     _, user_id, source_url, reason, status = review
     if status != "pending":
-        await query.edit_message_text(f"Already handled: {status}")
+        await callback_query.edit_message_text(f"Already handled: {status}")
         return
 
     if decision == "approve":
         await db.set_review_status(review_id, "approved")
-        await query.edit_message_text(f"✅ Approved review #{review_id}.")
-        await context.bot.send_message(
-            user_id, "✅ Admin ne approve kar diya! Video ab process ho raha hai..."
-        )
-        await process_video_job(context, user_id, source_url)
+        await callback_query.edit_message_text(f"✅ Approved review #{review_id}.")
+        await client.send_message(user_id, "✅ Admin ne approve kar diya! Video ab process ho raha hai...")
+        await process_video_job(client, user_id, source_url)
     else:
         await db.set_review_status(review_id, "rejected")
-        await query.edit_message_text(f"❌ Rejected review #{review_id}.")
-        await context.bot.send_message(
-            user_id, "❌ Admin ne bhi confirm kiya — ye content process nahi ho sakta."
-        )
+        await callback_query.edit_message_text(f"❌ Rejected review #{review_id}.")
+        await client.send_message(user_id, "❌ Admin ne bhi confirm kiya — ye content process nahi ho sakta.")
 
 
-# ---------------- feedback buttons ----------------
-
-async def feedback_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Dhanyawaad!")
-    _, clip_id, value = query.data.split("|")
+@app.on_callback_query(filters.regex(r"^fb\|"))
+async def feedback_cb(client, callback_query):
+    await callback_query.answer("Dhanyawaad!")
+    _, clip_id, value = callback_query.data.split("|")
     await db.set_clip_feedback(clip_id, int(value))
 
 
-async def platform_choice_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    _, platform = query.data.split("|")
+@app.on_callback_query(filters.regex(r"^platform\|"))
+async def platform_choice_cb(client, callback_query):
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    _, platform = callback_query.data.split("|")
 
     spec = pending_platform_choice.pop(user_id, None)
     if spec is None:
-        await query.edit_message_text("Ye request expire ho gayi. Video/link dobara bhejo.")
+        await callback_query.edit_message_text("Ye request expire ho gayi. Video/link dobara bhejo.")
         return
 
     label = {"instagram": "Instagram", "youtube": "YouTube", "both": "Instagram + YouTube"}[platform]
-    await query.edit_message_text(f"✅ {label} ke liye clips banayenge. Processing shuru...")
+    await callback_query.edit_message_text(f"✅ {label} ke liye clips banayenge. Processing shuru...")
 
     await process_video_job(
-        context, user_id, source_url=spec["source_url"],
-        status_message=query.message, local_video_path=spec["local_video_path"],
+        client, user_id, source_url=spec["source_url"],
+        status_message=callback_query.message, local_video_path=spec["local_video_path"],
         platform=platform,
     )
 
 
-# ---------------- core pipeline ----------------
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
+@app.on_message(filters.text & filters.incoming & ~filters.command([
+    "start", "history", "myappeals", "status", "addcredit", "allow4gb", "revoke4gb"
+]))
+async def handle_link(client, message):
+    user_id = message.from_user.id
+    text = message.text.strip()
 
     if not text.startswith("http"):
-        await update.message.reply_text("Ye valid link nahi lag raha. YouTube/Instagram/TikTok/Facebook link bhejo.")
+        await message.reply_text("Ye valid link nahi lag raha. YouTube/Instagram/TikTok/Facebook link bhejo.")
         return
 
     if user_id in active_jobs:
-        await update.message.reply_text("⏳ Tera pehle se ek video process ho raha hai. Uske complete hone ka wait karo.")
+        await message.reply_text("⏳ Tera pehle se ek video process ho raha hai. Uske complete hone ka wait karo.")
         return
 
     if not await db.can_process(user_id, FREE_DAILY_LIMIT):
-        await update.message.reply_text(
+        await message.reply_text(
             "🚫 Aaj ka free limit (5 videos) khatam ho gaya. Kal try karo ya admin se bonus credit maango."
         )
         return
 
     pending_platform_choice[user_id] = {"source_url": text, "local_video_path": None}
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📸 Instagram", callback_data="platform|instagram"),
-        InlineKeyboardButton("▶️ YouTube", callback_data="platform|youtube"),
-        InlineKeyboardButton("🔀 Dono", callback_data="platform|both"),
-    ]])
-    await update.message.reply_text(
-        "Kis platform ke liye clips chahiye?", reply_markup=kb
-    )
+    await message.reply_text("Kis platform ke liye clips chahiye?", reply_markup=platform_kb())
 
 
-async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    msg = update.message
+@app.on_message(filters.incoming & (filters.video | filters.document))
+async def handle_video_upload(client, message):
+    user_id = message.from_user.id
 
     if user_id in active_jobs:
-        await msg.reply_text("⏳ Tera pehle se ek video process ho raha hai. Uske complete hone ka wait karo.")
+        await message.reply_text("⏳ Tera pehle se ek video process ho raha hai. Uske complete hone ka wait karo.")
         return
 
     if not await db.can_process(user_id, FREE_DAILY_LIMIT):
-        await msg.reply_text(
+        await message.reply_text(
             "🚫 Aaj ka free limit (5 videos) khatam ho gaya. Kal try karo ya admin se bonus credit maango."
         )
         return
 
-    tg_file = msg.video or msg.document
-    if tg_file is None:
+    media = message.video or message.document
+    if media is None:
+        return
+
+    mime = getattr(media, "mime_type", "") or ""
+    if mime and not (mime.startswith("video/") or mime == "application/octet-stream"):
         return
 
     max_size = await db.get_max_file_size(user_id)
-    if tg_file.file_size and tg_file.file_size > max_size:
+    file_size = getattr(media, "file_size", 0) or 0
+    if file_size and file_size > max_size:
         limit_gb = max_size / (1024 ** 3)
-        await msg.reply_text(f"❌ File bahut badi hai. Tera limit {limit_gb:.0f}GB hai.")
+        await message.reply_text(f"❌ File bahut badi hai. Tera limit {limit_gb:.0f}GB hai.")
         return
-
-    # Processing safety cutoff: normal users up to 1GB, admin-approved 4GB
-    # users up to 4GB. (Separate from the accept/upload limit above.)
-    is_4gb_user = max_size > 2 * 1024 ** 3
-    safe_limit = ADMIN_SAFE_PROCESSING_BYTES if is_4gb_user else NORMAL_SAFE_PROCESSING_BYTES
-
-    if tg_file.file_size and tg_file.file_size > safe_limit:
-        limit_mb = safe_limit / (1024 ** 2)
-        await msg.reply_text(
-            f"⚠️ Ye file abhi ke server resources ke liye bahut badi hai "
-            f"(current safe limit ~{limit_mb:.0f}MB). Chhoti video try karo, "
-            f"ya link bhejo (link se processing zyada stable hai)."
-        )
-        return
-
-    status_msg = await msg.reply_text("📥 File download ho raha hai...")
 
     job_id = uuid.uuid4().hex[:12]
     local_path = os.path.join("downloads", f"{job_id}_upload.mp4")
 
+    status_msg = await message.reply_text(f"📥 Downloading...\n[{'░'*20}] 0%\n0.0MB / {_fmt_size(file_size)}")
+
     try:
-        file_obj = await context.bot.get_file(tg_file.file_id)
-        await file_obj.download_to_drive(local_path)
+        await message.download(
+            file_name=local_path,
+            progress=_progress_cb,
+            progress_args=(status_msg, "📥 Downloading...", message.id),
+        )
     except Exception as e:
         await status_msg.edit_text(f"❌ File download nahi ho payi: {str(e)[:150]}")
         return
 
+    if not os.path.exists(local_path):
+        await status_msg.edit_text("❌ File download nahi ho payi (file not saved).")
+        return
+
     await status_msg.edit_text("✅ File mil gayi.")
-    pending_platform_choice[user_id] = {"source_url": f"direct_upload:{tg_file.file_id}", "local_video_path": local_path}
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📸 Instagram", callback_data="platform|instagram"),
-        InlineKeyboardButton("▶️ YouTube", callback_data="platform|youtube"),
-        InlineKeyboardButton("🔀 Dono", callback_data="platform|both"),
-    ]])
-    await status_msg.reply_text("Kis platform ke liye clips chahiye?", reply_markup=kb)
+    pending_platform_choice[user_id] = {
+        "source_url": f"direct_upload:{job_id}",
+        "local_video_path": local_path,
+    }
+    await status_msg.reply_text("Kis platform ke liye clips chahiye?", reply_markup=platform_kb())
 
 
-async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, source_url: str,
+async def process_video_job(client, user_id: int, source_url: str,
                              status_message=None, local_video_path: str = None, platform: str = "both"):
     active_jobs.add(user_id)
     job_id = uuid.uuid4().hex[:12]
@@ -358,7 +371,7 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
     async def send_status(text):
         if status_message:
             return await status_message.reply_text(text)
-        return await context.bot.send_message(user_id, text)
+        return await client.send_message(user_id, text)
 
     try:
         await db.create_job(job_id, user_id, source_url)
@@ -367,7 +380,6 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
         cached_transcript = None
 
         if local_video_path is None:
-            # --- pre-download validation (link flow only) ---
             meta = await downloader.probe_metadata(source_url)
             dur_check = safety.check_duration(meta["duration"], MAX_VIDEO_SECONDS)
             if not dur_check["ok"]:
@@ -377,15 +389,11 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
 
             approx_size = meta.get("filesize_approx", 0)
             user_max_size = await db.get_max_file_size(user_id)
-            is_4gb_user = user_max_size > 2 * 1024 ** 3
-            safe_limit = ADMIN_SAFE_PROCESSING_BYTES if is_4gb_user else NORMAL_SAFE_PROCESSING_BYTES
-
-            if approx_size and approx_size > safe_limit:
-                limit_mb = safe_limit / (1024 ** 2)
+            if approx_size and approx_size > user_max_size:
+                limit_gb = user_max_size / (1024 ** 3)
                 await status_msg.edit_text(
-                    f"⚠️ Ye video abhi ke server resources ke liye bahut badi hai "
-                    f"(~{approx_size/(1024**2):.0f}MB, safe limit ~{limit_mb:.0f}MB). "
-                    "Chhoti video try karo."
+                    f"⚠️ Ye video bahut badi hai (~{approx_size/(1024**2):.0f}MB). "
+                    f"Tera limit {limit_gb:.0f}GB hai."
                 )
                 await db.update_job_status(job_id, "rejected")
                 return
@@ -403,7 +411,6 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
                 await db.update_job_status(job_id, "rejected")
                 return
 
-            # --- download (with caching) ---
             url_hash = downloader.url_hash(source_url)
             cached = await db.get_cached_download(url_hash)
 
@@ -415,7 +422,6 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
             if cached:
                 cached_transcript = cached[1]
         else:
-            # --- direct upload flow: skip link validation/download ---
             await status_msg.edit_text("🔎 Uploaded video check kar raha hoon...")
             duration = await clipper.get_video_duration(video_path)
             dur_check = safety.check_duration(duration, MAX_VIDEO_SECONDS)
@@ -427,20 +433,16 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
 
         await db.update_job_status(job_id, "processing")
 
-        # --- transcription ---
         await status_msg.edit_text("🎙️ Transcribing audio...")
         audio_path = os.path.join("downloads", f"{job_id}_audio.wav")
         await clipper.extract_audio(video_path, audio_path)
 
         if cached_transcript:
-            import json as _json
-            transcript = _json.loads(cached_transcript)
+            transcript = json.loads(cached_transcript)
         else:
             transcript = await ai_analysis.transcribe(audio_path)
-            import json as _json
-            await db.save_cached_download(url_hash, video_path, _json.dumps(transcript))
+            await db.save_cached_download(url_hash, video_path, json.dumps(transcript))
 
-        # --- AI analysis ---
         await status_msg.edit_text("🧠 Analyzing for viral moments...")
         video_duration = await clipper.get_video_duration(video_path)
         candidate_clips = await ai_analysis.analyze_for_clips(
@@ -454,13 +456,11 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
 
         all_words = transcript.get("words", [])
 
-        # --- cut + render each clip ---
         sent_count = 0
         for i, c in enumerate(candidate_clips, 1):
             await status_msg.edit_text(f"✂️ Cutting clip {i}/{len(candidate_clips)}...")
 
             clip_words = [w for w in all_words if c["start_time"] - 1 <= w["start"] <= c["end_time"] + 1]
-
             start = clipper.snap_to_word_boundary(c["start_time"], clip_words, is_start=True)
             end = clipper.snap_to_word_boundary(c["end_time"], clip_words, is_start=False)
 
@@ -469,7 +469,7 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
                 out_path = await clipper.cut_and_render_clip(
                     video_path, clip_id, start, end, clip_words, style="style_2"
                 )
-            except Exception as e:
+            except Exception:
                 logger.exception(f"Clip {i} render failed")
                 continue
 
@@ -489,9 +489,27 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
                 InlineKeyboardButton("👎", callback_data=f"fb|{clip_id}|-1"),
             ]])
 
-            with open(out_path, "rb") as vf:
-                await context.bot.send_video(user_id, vf, caption=caption, reply_markup=fb_kb)
-            sent_count += 1
+            upload_status = await status_msg.reply_text(f"⬆️ Uploading clip {i}/{len(candidate_clips)}...")
+            try:
+                await client.send_video(
+                    user_id, out_path, caption=caption, reply_markup=fb_kb,
+                    progress=_progress_cb,
+                    progress_args=(upload_status, f"⬆️ Uploading clip {i}...", hash(clip_id) & 0x7FFFFFFF),
+                )
+                sent_count += 1
+                try:
+                    await upload_status.delete()
+                except Exception:
+                    pass
+            except FloodWait as e:
+                await asyncio.sleep(e.value + 1)
+                try:
+                    await client.send_video(user_id, out_path, caption=caption, reply_markup=fb_kb)
+                    sent_count += 1
+                except Exception:
+                    logger.exception(f"Clip {i} upload failed after FloodWait retry")
+            except Exception:
+                logger.exception(f"Clip {i} upload failed")
 
         await status_msg.edit_text(f"✅ Done! {sent_count} clips bhej diye.")
         await db.update_job_status(job_id, "done")
@@ -504,25 +522,11 @@ async def process_video_job(context: ContextTypes.DEFAULT_TYPE, user_id: int, so
 
     finally:
         active_jobs.discard(user_id)
-        # cleanup temp files (keep original video cached, remove audio + subtitle temp files)
         await cleanup_files(audio_path)
         for f in os.listdir("clips"):
             if f.endswith(".ass"):
                 await cleanup_files(os.path.join("clips", f))
 
-
-# ---------------- main ----------------
-
-async def post_init(application: Application):
-    await db.init_db()
-    logger.info("Database initialized.")
-
-
-# ---------------- health check server (for Render free Web Service) ----------------
-# Render free tier only supports Web Services, which need to respond to HTTP
-# requests to stay "alive". The actual bot runs on Telegram polling in the
-# main thread; this tiny Flask server just answers pings on the port Render
-# expects, on a separate thread, so Render doesn't consider the service dead.
 
 health_app = Flask(__name__)
 
@@ -537,40 +541,23 @@ def run_health_server():
     health_app.run(host="0.0.0.0", port=port)
 
 
-def main():
-    threading.Thread(target=run_health_server, daemon=True).start()
+async def _startup():
+    await db.init_db()
+    logger.info("Database initialized.")
 
-    # Python 3.14 no longer auto-creates an event loop for the main thread.
-    # python-telegram-bot's run_polling() relies on asyncio.get_event_loop()
-    # internally, so we create and set one explicitly before building the app.
+
+def main():
+    Thread(target=run_health_server, daemon=True).start()
+
+    os.makedirs("downloads", exist_ok=True)
+    os.makedirs("clips", exist_ok=True)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    loop.run_until_complete(_startup())
 
-    builder = Application.builder().token(BOT_TOKEN).post_init(post_init)
-    if LOCAL_BOT_API_URL:
-        builder = builder.base_url(f"{LOCAL_BOT_API_URL}/bot").base_file_url(f"{LOCAL_BOT_API_URL}/file/bot")
-        logger.info(f"Using local Bot API server: {LOCAL_BOT_API_URL}")
-    app = builder.build()
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("history", history_cmd))
-    app.add_handler(CommandHandler("myappeals", myappeals_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-
-    app.add_handler(CommandHandler("addcredit", addcredit_cmd))
-    app.add_handler(CommandHandler("allow4gb", allow4gb_cmd))
-    app.add_handler(CommandHandler("revoke4gb", revoke4gb_cmd))
-
-    app.add_handler(CallbackQueryHandler(appeal_button_cb, pattern=r"^appeal\|"))
-    app.add_handler(CallbackQueryHandler(admin_review_cb, pattern=r"^radm\|"))
-    app.add_handler(CallbackQueryHandler(feedback_cb, pattern=r"^fb\|"))
-    app.add_handler(CallbackQueryHandler(platform_choice_cb, pattern=r"^platform\|"))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video_upload))
-
-    logger.info("Bot starting...")
-    app.run_polling()
+    logger.info("Bot starting (Pyrogram)...")
+    app.run()
 
 
 if __name__ == "__main__":
