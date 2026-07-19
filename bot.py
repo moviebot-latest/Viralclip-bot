@@ -123,10 +123,22 @@ async def _progress_cb(current: int, total: int, status_msg, label: str, msg_key
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
     await message.reply_text(
-        "👋 Bhej de koi bhi YouTube/Instagram/TikTok/Facebook link ya video file — "
-        "main usme se best 10 viral clips nikaal ke dunga, hooks aur captions ke saath.\n\n"
-        "Free: 5 videos/day, 2GB file size. Zyada chahiye toh admin se bonus credit maango.\n\n"
-        "⚠️ Disclaimer: content ki copyright responsibility tumhari hai, bot sirf ek tool hai."
+        "🎬 **ViralClip Bot** — AI Video Clipper\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Bhej de koi bhi:\n"
+        "📹 YouTube / Instagram / TikTok / Facebook link\n"
+        "📁 Ya seedha video file\n\n"
+        "Main karunga:\n"
+        "🎙️ Audio transcribe\n"
+        "🧠 AI se best viral moments dhoondunga\n"
+        "✂️ Auto-cut + smart crop (9:16)\n"
+        "💬 Captions + hooks add karunga\n"
+        "📊 Virality score ke saath 5-10 clips bhejunga\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💎 **Free**: 5 videos/day, 2GB file size\n"
+        "🎁 Zyada chahiye? Admin se bonus credit maango\n\n"
+        "📌 Commands: /history · /status · /myappeals\n\n"
+        "⚠️ Content ki copyright responsibility tumhari hai — bot sirf ek tool hai."
     )
 
 
@@ -455,21 +467,44 @@ async def process_video_job(client, user_id: int, source_url: str,
         transcribe_start = time.time()
         if cached_transcript:
             transcript = json.loads(cached_transcript)
+            # Guard against reusing a broken/empty transcript from an earlier
+            # failed attempt — if it looks empty, re-transcribe instead of
+            # silently propagating the same bad result forever.
+            if not transcript.get("text", "").strip() and not transcript.get("segments"):
+                transcript = await ai_analysis.transcribe(audio_path)
+                await db.save_cached_download(url_hash, video_path, json.dumps(transcript))
         else:
             transcript = await ai_analysis.transcribe(audio_path)
             await db.save_cached_download(url_hash, video_path, json.dumps(transcript))
         transcribe_elapsed = time.time() - transcribe_start
 
+        word_count = len(transcript.get("text", "").split())
+        segment_count = len(transcript.get("segments", []))
+
         await status_msg.edit_text(
             f"🧠 Analyzing for viral moments...\n"
-            f"(transcription took {transcribe_elapsed:.0f}s)"
+            f"(transcription took {transcribe_elapsed:.0f}s · "
+            f"{word_count} words, {segment_count} segments detected)"
         )
+
+        if word_count == 0:
+            await status_msg.edit_text(
+                "😕 Is video mein koi speech/audio detect nahi hui (silent video ya audio issue ho sakta hai). "
+                "Koi clip nahi ban sakta."
+            )
+            await db.update_job_status(job_id, "failed")
+            return
+
         candidate_clips = await ai_analysis.analyze_for_clips(
             transcript, MAX_CLIPS, video_duration=video_duration, platform=platform
         )
 
         if not candidate_clips:
-            await status_msg.edit_text("😕 Koi high-value moment nahi mila is video mein.")
+            await status_msg.edit_text(
+                f"😕 Koi high-value moment nahi mila is video mein "
+                f"({word_count} words transcribed, lekin AI ko viral-worthy moment nahi mila).\n"
+                f"Koi doosri video try karo, ya wahi video dobara bhejo."
+            )
             await db.update_job_status(job_id, "failed")
             return
 
@@ -501,11 +536,17 @@ async def process_video_job(client, user_id: int, source_url: str,
                 c["hook_text"], c["suggested_platform"], start, end,
             )
 
+            score = c["virality_score"]
+            score_emoji = "🔥🔥🔥" if score >= 80 else "🔥🔥" if score >= 60 else "🔥"
+            duration_str = f"{int((end-start)//60)}:{int((end-start)%60):02d}"
+
             caption = (
-                f"🔥 Virality Score: {c['virality_score']}/100\n"
+                f"{score_emoji} **Virality Score: {score}/100**\n"
+                f"━━━━━━━━━━━━━━━━\n"
                 f"💡 {c['reasoning']}\n"
-                f"📱 Best for: {c['suggested_platform']}\n"
-                f"⏱️ Original timestamp: {int(start//60)}:{int(start%60):02d}"
+                f"📱 Best for: **{c['suggested_platform']}**\n"
+                f"⏱️ Clip length: {duration_str} · Original: {int(start//60)}:{int(start%60):02d}\n"
+                f"🏷️ Hook: \"{c['hook_text']}\""
             )
             fb_kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("👍", callback_data=f"fb|{clip_id}|1"),
