@@ -518,4 +518,52 @@ async def process_video_job(client, user_id: int, source_url: str,
                 logger.exception(f"Clip {i} upload failed")
 
         await status_msg.edit_text(f"✅ Done! {sent_count} clips bhej diye.")
-        await db.update_jo
+        await db.update_job_status(job_id, "done")
+        await db.increment_usage(user_id)
+
+    except Exception as e:
+        logger.exception("Job failed")
+        await send_status(f"❌ Kuch galat ho gaya: {str(e)[:200]}\nDobara try karo.")
+        await db.update_job_status(job_id, "failed")
+
+    finally:
+        active_jobs.discard(user_id)
+        await cleanup_files(audio_path)
+        for f in os.listdir("clips"):
+            if f.endswith(".ass"):
+                await cleanup_files(os.path.join("clips", f))
+
+
+health_app = Flask(__name__)
+
+
+@health_app.route("/")
+def health():
+    return "Bot is running.", 200
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    health_app.run(host="0.0.0.0", port=port)
+
+
+async def _startup():
+    await db.init_db()
+    logger.info("Database initialized.")
+
+
+def main():
+    Thread(target=run_health_server, daemon=True).start()
+
+    os.makedirs("downloads", exist_ok=True)
+    os.makedirs("clips", exist_ok=True)
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_startup())
+
+    logger.info("Bot starting (Pyrogram)...")
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
